@@ -1,0 +1,38 @@
+#include "resource.h"
+#pragma code_page(1252)
+
+1 24 "ArcManager.manifest"
+IDI_APPICON ICON "res/ArcManager.ico"
+IDR_DEFAULT_BG RCDATA "res/default_background.png"
+
+// ---------------------------------------------------------------------------------------------
+// Version information (Explorer -> Properties -> Details). The VALUES come from resource.h:
+// edit them THERE, not here. Only change this block to add a field or switch the language.
+// ---------------------------------------------------------------------------------------------
+1 VERSIONINFO
+FILEVERSION    APP_VERSION_NUMERIC
+PRODUCTVERSION APP_VERSION_NUMERIC
+FILEFLAGSMASK  0x3fL      // which FILEFLAGS bits are valid
+FILEFLAGS      0x0L       // 0 = a normal release (0x2 would mean pre-release)
+FILEOS         0x4L       // Windows 32-bit
+FILETYPE       0x1L       // application
+FILESUBTYPE    0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"  // 0409 = English (United States), 04B0 = Unicode text
+        BEGIN
+            VALUE "FileDescription",  APP_FILE_DESCRIPTION
+            VALUE "FileVersion",      APP_VERSION_TEXT
+            VALUE "ProductName",      APP_PRODUCT_NAME
+            VALUE "ProductVersion",   APP_VERSION_TEXT
+            VALUE "LegalCopyright",   APP_COPYRIGHT
+            VALUE "InternalName",     "ArcManager"
+            VALUE "OriginalFilename", "ArcManager.exe"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 0x04B0   // language: English (United States), Unicode
+    END
+END
