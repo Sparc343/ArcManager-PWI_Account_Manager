@@ -50,12 +50,12 @@ static const COLORREF cAmber  = RGB(240, 170, 60);
 static const COLORREF cStopBg = RGB(70, 70, 80);
 
 enum {
-    ID_TITLE = 800, ID_HDR1, ID_HDR2, ID_HDR3, ID_BLANKHINT, ID_STORAGEHINT,
-    ID_ADD = 810, ID_SHOWPW = 811, ID_GEAR = 812, ID_LOG = 813, ID_IMPORT = 814, ID_EXPORT = 815,
-    ID_TIMER = 1, ID_BGTIMER = 2,
+    ID_TITLE = 800, ID_HDR1, ID_HDR2, ID_HDR3, ID_BLANKHINT, ID_STORAGEHINT, ID_VERSION,
+    ID_ADD = 810, ID_SHOWPW = 811, ID_GEAR = 812, ID_LOG = 813, ID_IMPORT = 814, ID_EXPORT = 815, ID_MODE = 816,
+    ID_TIMER = 1, ID_BGTIMER = 2, ID_PRIVTIMER = 3, ID_MARQUEE = 4,
     ID_ROW_BASE = 1000
 };
-enum { K_USER = 0, K_PASS, K_NOTES, K_SIGN, K_STOP, K_STATUS };
+enum { K_USER = 0, K_PASS, K_NOTES, K_SIGN, K_STOP, K_STATUS, K_DEL, K_UP, K_DOWN };
 static inline int RowId(int row, int kind) { return ID_ROW_BASE + row * 10 + kind; }
 
 typedef std::vector<DWORD> PidList;
@@ -69,12 +69,19 @@ struct Settings {
     int windowWidth, windowHeight;
     bool rememberSize;
     int renameDurationSeconds, statusResetSeconds;
+    // ---- login pop-up and typing (official game; nothing happens with the defaults)
+    bool popEsc, enterAfterPw;
+    int popPresses, popPause, clearBs;
+    // ---- private servers
+    bool privateMode, privShowWarning, privEnterAfter, privPopupEsc;
+    std::wstring privPath, privFlags, privProcNames;
+    int privWindowWait, privFirstKey, privEnters, privPausePopup, privPauseStep, privTabs, privClear;
     std::wstring bgImage, bgMode;
     double bgDim;
 };
 static Settings S;
 
-static std::wstring g_iniPath, g_configDir, g_accountsPath, g_logPath, g_prevLogPath, g_sessionPath, g_exeDir;
+static std::wstring g_iniPath, g_configDir, g_accountsPath, g_logPath, g_prevLogPath, g_sessionPath, g_exeDir;   // accounts + session paths belong to the current mode (see ApplyModePaths)
 static HINSTANCE g_hInst;
 static HWND g_hwnd;
 static HFONT g_font, g_fontBold, g_fontTitle;
@@ -184,6 +191,11 @@ static std::wstring EnvVar(const wchar_t* name) {
     DWORD n = GetEnvironmentVariableW(name, buf, 1024);
     return (n > 0 && n < 1024) ? std::wstring(buf, n) : std::wstring();
 }
+// the official game and private servers each have their own accounts list and session file
+static void ApplyModePaths() {
+    g_accountsPath = g_configDir + (S.privateMode ? L"\\accounts-private.txt" : L"\\accounts.txt");
+    g_sessionPath = g_configDir + (S.privateMode ? L"\\session-private.txt" : L"\\session.txt");
+}
 static void InitPaths() {
     wchar_t exe[MAX_PATH];
     GetModuleFileNameW(NULL, exe, MAX_PATH);
@@ -223,6 +235,14 @@ static const char* kDefaultIni =
     "LoginDelayMs=3000\r\n"
     "MinWaitSeconds=6\r\n"
     "WindowTimeoutSeconds=40\r\n"
+    "; Login pop-up and typing. The official game needs none of this right now (the defaults do nothing); it is here in case Arc ever shows a\r\n"
+    "; message before its login page. PopupKey: enter or escape, pressed EntersBefore times (0 = none), then a pause in milliseconds\r\n"
+    "PopupKey=enter\r\n"
+    "EntersBefore=0\r\n"
+    "PauseAfterPopupMs=1500\r\n"
+    "; Backspaces pressed before typing a box, to remove old text (0 = none), and whether Enter is pressed after the password (1 = yes)\r\n"
+    "ClearBackspaces=0\r\n"
+    "EnterAfterPassword=1\r\n"
     "; CloseArcAt: launcher (as soon as Arc starts launcher.exe) or game (wait for elementclient.exe)\r\n"
     "CloseArcAt=launcher\r\n"
     "LauncherGraceSeconds=2\r\n"
@@ -241,12 +261,34 @@ static const char* kDefaultIni =
     "; Messages such as Stopped / Cancelled / Timed out go back to Idle after this many seconds (0 = never)\r\n"
     "StatusResetSeconds=90\r\n"
     "; Background image. Leave BackgroundImage blank to use background.png/jpg/jpeg/bmp/gif found next to the program or in %AppData%\\ArcManager;\r\n"
-    "; if none is found, the C++ version uses its built-in image (the PowerShell version a plain dark background).\r\n"
+    "; if none is found, the built-in image is used.\r\n"
     "BackgroundImage=\r\n"
     "; BackgroundMode: fill (cover, cropped) | fit (whole image, bars) | stretch | tile | center\r\n"
     "BackgroundMode=fill\r\n"
     "; BackgroundDim: 0 = image as-is ... 1 = black (keeps the text readable)\r\n"
     "BackgroundDim=0.5\r\n"
+    "; ---- Private servers (used while the switch at the top of the main window is on PRIVATE; Arc is not used then) ----\r\n"
+    "PrivateMode=0\r\n"
+    "; the program to start (the game client or a launcher; it starts in its own folder) and its command-line flags\r\n"
+    "PrivateClientPath=\r\n"
+    "PrivateFlags=game:cpw nocheck startbypatcher console:1\r\n"
+    "; show a warning every time you switch to Private Servers: 1 = yes, 0 = no\r\n"
+    "PrivateShowWarning=1\r\n"
+    "; process name(s) of the real game client, separated by commas\r\n"
+    "PrivateProcessNames=elementclient.exe,elementclient_64.exe\r\n"
+    "; give up if the game client / its window does not appear within this many seconds, then wait this long before the first key\r\n"
+    "PrivateWindowWaitSeconds=90\r\n"
+    "PrivateFirstKeyDelaySeconds=6\r\n"
+    "; the typing sequence: Enter or Escape (start-up pop-up) x N, pause, username, Tab x N, password, Enter. Pauses are in milliseconds\r\n"
+    "; PrivatePopupKey: the key that clears the start-up pop-up of the client: enter or escape\r\n"
+    "PrivatePopupKey=enter\r\n"
+    "PrivateEntersBefore=1\r\n"
+    "PrivatePauseAfterPopupMs=1500\r\n"
+    "PrivatePauseStepMs=400\r\n"
+    "PrivateTabs=1\r\n"
+    "; Backspaces pressed before typing a box, to remove old text (0 = none)\r\n"
+    "PrivateClearBackspaces=0\r\n"
+    "PrivateEnterAfterPassword=1\r\n"
     "; Advanced (not shown in the settings window). PowerShell version only (this program always asks for administrator rights): 1 = restart as administrator\r\n"
     "RunElevated=1\r\n";
 
@@ -255,6 +297,10 @@ static Settings DefaultSettings() {
     Settings d;
     d.arcPath = L"C:\\Program Files (x86)\\Arc\\Arc.exe";
     d.autoFill = true; d.closeAtLauncher = true; d.confirmStop = false; d.killArcOnStart = true; d.debugLog = true; d.showStorageHint = false; d.renameWindows = true; d.renameDurationSeconds = 180; d.statusResetSeconds = 90;
+    d.popEsc = false; d.enterAfterPw = true; d.popPresses = 0; d.popPause = 1500; d.clearBs = 0;
+    d.privateMode = false; d.privShowWarning = true; d.privEnterAfter = true; d.privPopupEsc = false;
+    d.privPath = L""; d.privFlags = L"game:cpw nocheck startbypatcher console:1"; d.privProcNames = L"elementclient.exe,elementclient_64.exe";
+    d.privWindowWait = 90; d.privFirstKey = 6; d.privEnters = 1; d.privPausePopup = 1500; d.privPauseStep = 400; d.privTabs = 1; d.privClear = 0;
     d.usernameFocusTabs = 1; d.fieldSeparatorTabs = 1; d.loginDelayMs = 3000; d.minWaitSeconds = 6; d.windowTimeoutSeconds = 40;
     d.graceSeconds = 6; d.launcherGraceSeconds = 2; d.timeoutSeconds = 300; d.pendingTimeoutSeconds = 600;
     d.windowWidth = 1280; d.windowHeight = 720; d.rememberSize = true;
@@ -294,6 +340,12 @@ static std::wstring IniStr(const wchar_t* key, const wchar_t* def) {
 static int IniInt(const wchar_t* key, int def) {
     return (int)GetPrivateProfileIntW(L"Settings", key, def, g_iniPath.c_str());
 }
+// removes a setting that no longer exists from the settings file (if it is there)
+static void RemoveObsoleteKey(const wchar_t* key) {
+    wchar_t buf[8];
+    GetPrivateProfileStringW(L"Settings", key, L"\x01", buf, 8, g_iniPath.c_str());
+    if (buf[0] != 1) WritePrivateProfileStringW(L"Settings", key, NULL, g_iniPath.c_str());
+}
 static void LoadSettings() {
     if (!FileExists(g_iniPath)) WriteUnicodeFile(g_iniPath, FromUtf8(kDefaultIni, (int)strlen(kDefaultIni)));
     else EnsureUnicodeIni();
@@ -316,8 +368,28 @@ static void LoadSettings() {
     S.renameWindows = IniInt(L"RenameGameWindows", D.renameWindows) != 0;
     S.renameDurationSeconds = IniInt(L"RenameDurationSeconds", D.renameDurationSeconds);
     S.statusResetSeconds = IniInt(L"StatusResetSeconds", D.statusResetSeconds);
+    S.popEsc = _wcsicmp(Trim(IniStr(L"PopupKey", L"enter")).c_str(), L"escape") == 0;
+    S.popPresses = IniInt(L"EntersBefore", D.popPresses);
+    S.popPause = IniInt(L"PauseAfterPopupMs", D.popPause);
+    S.clearBs = IniInt(L"ClearBackspaces", D.clearBs);
+    S.enterAfterPw = IniInt(L"EnterAfterPassword", D.enterAfterPw) != 0;
+    S.privateMode = IniInt(L"PrivateMode", D.privateMode) != 0;
+    S.privShowWarning = IniInt(L"PrivateShowWarning", D.privShowWarning) != 0;
+    S.privPath = Trim(IniStr(L"PrivateClientPath", L""));
+    S.privFlags = Trim(IniStr(L"PrivateFlags", D.privFlags.c_str()));
+    S.privProcNames = Trim(IniStr(L"PrivateProcessNames", D.privProcNames.c_str()));
+    if (S.privProcNames.empty()) S.privProcNames = D.privProcNames;
+    S.privPopupEsc = _wcsicmp(Trim(IniStr(L"PrivatePopupKey", L"enter")).c_str(), L"escape") == 0;
+    S.privWindowWait = IniInt(L"PrivateWindowWaitSeconds", D.privWindowWait);
+    S.privFirstKey = IniInt(L"PrivateFirstKeyDelaySeconds", D.privFirstKey);
+    S.privEnters = IniInt(L"PrivateEntersBefore", D.privEnters);
+    S.privPausePopup = IniInt(L"PrivatePauseAfterPopupMs", D.privPausePopup);
+    S.privPauseStep = IniInt(L"PrivatePauseStepMs", D.privPauseStep);
+    S.privTabs = IniInt(L"PrivateTabs", D.privTabs);
+    S.privClear = IniInt(L"PrivateClearBackspaces", D.privClear);
+    S.privEnterAfter = IniInt(L"PrivateEnterAfterPassword", D.privEnterAfter) != 0;
     S.debugLog = IniInt(L"DebugLog", D.debugLog) != 0;
-    S.windowWidth = std::max(900, IniInt(L"WindowWidth", D.windowWidth));
+    S.windowWidth = std::max(1040, IniInt(L"WindowWidth", D.windowWidth));
     S.windowHeight = std::max(420, IniInt(L"WindowHeight", D.windowHeight));
     S.rememberSize = IniInt(L"RememberWindowSize", D.rememberSize) != 0;
     S.bgImage = Trim(IniStr(L"BackgroundImage", L""));
@@ -329,6 +401,10 @@ static void LoadSettings() {
     S.bgDim = wcstod(dim.c_str(), NULL);
     if (S.bgDim < 0.0) S.bgDim = 0.0;
     if (S.bgDim > 1.0) S.bgDim = 1.0;
+    // clean-up of settings that were removed in later versions
+    // RemoveObsoleteKey(L"PrivateStartDir");   (these two are gone: remove the // in front of the next two lines only if they are needed again)
+    RemoveObsoleteKey(L"PrivateStartDir");
+    RemoveObsoleteKey(L"PrivateNoticeShown");
 }
 
 // For safety the manager only ever launches a program named Arc.exe (it runs with administrator rights).
@@ -368,7 +444,27 @@ static PidList PidsByName(const std::vector<Proc>& snap, const wchar_t* n1, cons
     return out;
 }
 static PidList ArcPids(const std::vector<Proc>& s) { return PidsByName(s, L"Arc.exe"); }
-static PidList GamePids(const std::vector<Proc>& s) { return PidsByName(s, L"elementclient.exe", L"elementclient_64.exe"); }
+// process names given as a comma separated list (the private server settings)
+static PidList PidsByNameList(const std::vector<Proc>& snap, const std::wstring& csv) {
+    std::vector<std::wstring> names;
+    size_t start = 0;
+    while (start <= csv.size()) {
+        size_t c = csv.find(L',', start);
+        std::wstring n = Trim(csv.substr(start, c == std::wstring::npos ? std::wstring::npos : c - start));
+        if (!n.empty()) names.push_back(n);
+        if (c == std::wstring::npos) break;
+        start = c + 1;
+    }
+    PidList out;
+    for (size_t i = 0; i < snap.size(); i++)
+        for (size_t k = 0; k < names.size(); k++)
+            if (_wcsicmp(snap[i].name.c_str(), names[k].c_str()) == 0) { out.push_back(snap[i].pid); break; }
+    return out;
+}
+static PidList GamePids(const std::vector<Proc>& s) {
+    if (S.privateMode) return PidsByNameList(s, S.privProcNames);   // private servers: the names from the settings
+    return PidsByName(s, L"elementclient.exe", L"elementclient_64.exe");
+}
 // launcher.exe / patcher.exe started directly by one of the given Arc processes
 static PidList LauncherPidsOf(const std::vector<Proc>& snap, const PidList& arcPids) {
     PidList out;
@@ -489,7 +585,8 @@ static void SetClipboardText(const std::wstring& s) {
 
 // ------------------------------------------------------------------ rows + launch state
 struct Row {
-    HWND user, pass, notes, sign, stop, status;
+    HWND user, pass, notes, sign, stop, status, del, up, down;
+    bool selected;   // marked with CONTROL+CLICK on its minus button (deleted with ALT+D)
     DWORD gamePid;
     unsigned long long gameStart; DWORD gameStartPid;     // start time of the game client (tells it apart from a reused PID)
     std::wstring title; DWORD titlePid; DWORD titleSeen;   // window renaming state
@@ -506,8 +603,9 @@ struct Active {
     PidList gameBase, arcBase, arcPids;
     HWND hwnd; DWORD hwndSince; DWORD seenAt; bool triggerLauncher;
     PidList launchBase;   // launcher.exe / patcher.exe that already existed when this sign-in began
+    bool priv;            // a private-server sign-in (handled by PrivateTick, not by UpdateStateCore)
 };
-static Active g_active = { -1, PH_NONE, 0, PidList(), PidList(), PidList(), NULL, 0, 0, false, PidList() };
+static Active g_active = { -1, PH_NONE, 0, PidList(), PidList(), PidList(), NULL, 0, 0, false, PidList(), false };
 
 static void SetStatus(int i, const std::wstring& text, COLORREF col, bool transient = false) {
     Row& r = g_rows[i];
@@ -529,6 +627,7 @@ static void FinishActive(const std::wstring& text, COLORREF col, bool transient 
     SetStatus(i, text, col, transient);
     g_active.row = -1;
     g_active.phase = PH_NONE;
+    g_active.priv = false;
 }
 static void Msg(const wchar_t* text, const wchar_t* title) { MessageBoxW(g_hwnd, text, title, MB_OK | MB_ICONINFORMATION); }
 
@@ -623,6 +722,12 @@ static void Fallback(int row, const std::wstring& why) {
     SetStatus(row, why + L" - sign in manually (name copied)", cAmber);
 }
 
+// removes old text from a box before typing: End, then N Backspaces (0 = nothing)
+static void ClearBoxKeys(int n) {
+    if (n <= 0) return;
+    TapKey(VK_END);
+    for (int k = 0; k < n; k++) TapKey(VK_BACK);
+}
 static void InvokeAutoFill() {
     int i = g_active.row;
     std::wstring user = Trim(GetText(g_rows[i].user));
@@ -638,10 +743,15 @@ static void InvokeAutoFill() {
     GetWindowTextW(g_active.hwnd, title, 128);
     Log(L"typing into window class='" + std::wstring(cls) + L"' title='" + std::wstring(title) + L"'");
 
+    for (int k = 0; k < S.popPresses; k++) {   // a message before the login page (not needed by Arc today): Enter or Escape
+        TapKey(S.popEsc ? VK_ESCAPE : VK_RETURN);
+        Sleep(k == S.popPresses - 1 ? S.popPause : 400);
+    }
     for (int k = 0; k < S.usernameFocusTabs; k++) TapKey(VK_TAB);
     Sleep(300);
     Log(L"typing username (" + std::to_wstring((long long)user.size()) + L" chars)");
     CtrlA();
+    ClearBoxKeys(S.clearBs);
     TypeText(user);
     Sleep(200);
     for (int k = 0; k < S.fieldSeparatorTabs; k++) TapKey(VK_TAB);
@@ -651,9 +761,10 @@ static void InvokeAutoFill() {
     if (!ArcFocused(g_active.arcPids)) { SetStatus(i, L"Focus left Arc - password was NOT typed", cAmber); Log(L"focus left Arc before password"); return; }
     Log(L"typing password (" + std::to_wstring((long long)pass.size()) + L" chars)");
     CtrlA();
+    ClearBoxKeys(S.clearBs);
     TypeText(pass);
     Sleep(200);
-    TapKey(VK_RETURN);
+    if (S.enterAfterPw) TapKey(VK_RETURN);
     SetStatus(i, L"Signed in as '" + user + L"' - click Play in Arc", cWhite);
 }
 
@@ -748,7 +859,206 @@ static void AutoConfigArcPath() {
     Log(L"Arc.exe detected automatically; ArcPath updated");
 }
 
+// ------------------------------------------------------------------ private servers
+// SIGN IN in private mode: start the configured program, wait for the game client and its window, then type the login
+// (Enter x N for the start-up pop-up, username, Tab x N, password, Enter). It never touches Arc.
+static PidList ClaimedPids();
+struct PrivStep { int kind; DWORD pause; };   // kind: 0 = Enter, 1 = Tab, 2 = username, 3 = password, 4 = Escape
+enum { PRV_NONE, PRV_CLIENT, PRV_WINDOW, PRV_TYPING };
+struct PrivState {
+    int row, phase;
+    DWORD start, lastCheck, windowSeen, nextAt, launchedPid;
+    int refocus;
+    HWND hwnd;
+    PidList base;
+    std::vector<PrivStep> steps;
+    size_t idx;
+};
+static PrivState g_priv;
+
+static bool PrivProcessAlive(DWORD pid) {
+    if (!pid) return false;
+    HANDLE h = OpenProcess(SYNCHRONIZE, FALSE, pid);
+    if (!h) return false;
+    bool alive = WaitForSingleObject(h, 0) == WAIT_TIMEOUT;
+    CloseHandle(h);
+    return alive;
+}
+static void PrivEnd(const std::wstring& text, COLORREF col, bool transient) {
+    KillTimer(g_hwnd, ID_PRIVTIMER);
+    g_priv.phase = PRV_NONE;
+    g_priv.row = -1;
+    g_priv.steps.clear();
+    FinishActive(text, col, transient);
+}
+static void PrivateCancel() {
+    int i = g_priv.row;
+    Row& r = g_rows[i];
+    if (g_priv.launchedPid && PrivProcessAlive(g_priv.launchedPid)) KillPid(g_priv.launchedPid);   // the program this sign-in started
+    if (r.gamePid == g_priv.launchedPid) r.gamePid = 0;
+    Log(L"private sign-in cancelled by user");
+    if (r.gamePid && PrivProcessAlive(r.gamePid)) PrivEnd(L"Running (PID " + std::to_wstring((long long)r.gamePid) + L")", cGreen, false);   // a client started by a launcher stays open
+    else { r.gamePid = 0; PrivEnd(L"Cancelled - the program that was started was closed", cGray, true); }
+}
+static void PrivateBuildSteps() {
+    g_priv.steps.clear();
+    PrivStep st;
+    for (int k = 0; k < S.privEnters; k++) { st.kind = S.privPopupEsc ? 4 : 0; st.pause = (DWORD)((k == S.privEnters - 1) ? S.privPausePopup : S.privPauseStep); g_priv.steps.push_back(st); }
+    st.kind = 2; st.pause = (DWORD)S.privPauseStep; g_priv.steps.push_back(st);
+    for (int k = 0; k < S.privTabs; k++) { st.kind = 1; st.pause = (DWORD)S.privPauseStep; g_priv.steps.push_back(st); }
+    st.kind = 3; st.pause = (DWORD)S.privPauseStep; g_priv.steps.push_back(st);
+    if (S.privEnterAfter) { st.kind = 0; st.pause = 0; g_priv.steps.push_back(st); }
+    g_priv.idx = 0;
+}
+static void PrivateClearBox() {
+    if (S.privClear <= 0) return;
+    TapKey(VK_END);
+    for (int k = 0; k < S.privClear; k++) TapKey(VK_BACK);
+}
+static void PrivateTick() {
+    if (g_priv.phase == PRV_NONE || g_priv.row < 0 || g_priv.row >= (int)g_rows.size()) return;
+    int i = g_priv.row;
+    Row& r = g_rows[i];
+    DWORD now = GetTickCount();
+    double elapsed = (now - g_priv.start) / 1000.0;
+
+    if (g_priv.phase == PRV_CLIENT) {   // wait for the game client process
+        if (now - g_priv.lastCheck < 1000) return;
+        g_priv.lastCheck = now;
+        PidList fresh = Minus(Minus(GamePids(Snapshot()), g_priv.base), ClaimedPids());
+        if (!fresh.empty()) {
+            r.gamePid = fresh[0];
+            Log(L"game client found (pid " + std::to_wstring((long long)r.gamePid) + L")");
+            if (!S.autoFill) { PrivEnd(L"Running (PID " + std::to_wstring((long long)r.gamePid) + L")", cGreen, false); return; }
+            g_priv.phase = PRV_WINDOW;
+            g_priv.windowSeen = 0;
+            SetStatus(i, L"Game client started (PID " + std::to_wstring((long long)r.gamePid) + L") - waiting for its window", cWhite);
+        } else if (elapsed > S.privWindowWait) {
+            Log(L"timed out waiting for the game client");
+            PrivEnd(L"Timed out waiting for the game client", cAmber, true);
+        }
+        return;
+    }
+    if (g_priv.phase == PRV_WINDOW) {   // wait for its window, then a few more seconds
+        if (now - g_priv.lastCheck < 500) return;
+        g_priv.lastCheck = now;
+        if (!PrivProcessAlive(r.gamePid)) { r.gamePid = 0; PrivEnd(L"The game client closed before the login", cAmber, true); return; }
+        PidList one;
+        one.push_back(r.gamePid);
+        HWND h = FindVisibleWindow(one);
+        if (!h) {
+            g_priv.windowSeen = 0;
+            if (elapsed > S.privWindowWait) { Log(L"timed out waiting for the game window"); PrivEnd(L"Timed out waiting for the game window", cAmber, true); }
+            return;
+        }
+        if (!g_priv.windowSeen) g_priv.windowSeen = now ? now : 1;
+        if (now - g_priv.windowSeen < (DWORD)S.privFirstKey * 1000) return;
+        g_priv.hwnd = h;
+        PrivateBuildSteps();
+        g_priv.refocus = 0;
+        g_priv.nextAt = now;
+        g_priv.phase = PRV_TYPING;
+        Log(L"game window found - typing the login");
+        SetStatus(i, L"Typing the login...", cWhite);
+        return;
+    }
+
+    // PRV_TYPING: one step at a time, so the manager never freezes and CANCEL works at any moment
+    if (now < g_priv.nextAt) return;
+    if (g_priv.idx >= g_priv.steps.size()) {
+        Log(L"login typed");
+        PrivEnd(L"Running (PID " + std::to_wstring((long long)r.gamePid) + L")", cGreen, false);
+        return;
+    }
+    if (!PrivProcessAlive(r.gamePid)) { r.gamePid = 0; PrivEnd(L"The game client closed during the login", cAmber, true); return; }
+    PidList one;
+    one.push_back(r.gamePid);
+    if (!g_priv.hwnd || !IsWindow(g_priv.hwnd)) g_priv.hwnd = FindVisibleWindow(one);
+    DWORD fpid = 0;
+    GetWindowThreadProcessId(GetForegroundWindow(), &fpid);
+    if (fpid != r.gamePid) {   // the game window must have the keyboard
+        if (++g_priv.refocus > 10) { Log(L"could not focus the game window"); PrivEnd(L"Could not focus the game window - the login was NOT typed", cAmber, true); return; }
+        if (g_priv.hwnd) BringToFront(g_priv.hwnd);
+        g_priv.nextAt = now + 300;
+        return;
+    }
+    g_priv.refocus = 0;
+    PrivStep st = g_priv.steps[g_priv.idx++];
+    if (st.kind == 0) TapKey(VK_RETURN);
+    else if (st.kind == 4) TapKey(VK_ESCAPE);
+    else if (st.kind == 1) TapKey(VK_TAB);
+    else if (st.kind == 2) {
+        std::wstring user = Trim(GetText(r.user));
+        Log(L"typing username (" + std::to_wstring((long long)user.size()) + L" chars)");
+        PrivateClearBox();
+        TypeText(user);
+    } else if (st.kind == 3) {
+        std::wstring pass = GetText(r.pass);
+        if (pass.empty()) { Log(L"no password saved - stopping after the username"); PrivEnd(L"Username typed - no password saved, enter it in the game", cAmber, false); return; }
+        Log(L"typing password (" + std::to_wstring((long long)pass.size()) + L" chars)");
+        PrivateClearBox();
+        TypeText(pass);
+    }
+    g_priv.nextAt = GetTickCount() + st.pause;
+}
+static void PrivatePlay(int i) {
+    if (g_active.row >= 0) {
+        if (g_active.row == i && g_active.priv) PrivateCancel();   // the button reads CANCEL while it works
+        else Msg(L"Another account is still launching. Wait for it to finish, or cancel it first.", L"Busy");
+        return;
+    }
+    Row& r = g_rows[i];
+    if (r.gamePid) { Msg(L"That account already has a game client running.", L"Already running"); return; }
+    if (Trim(GetText(r.user)).empty()) { Msg(L"Type an account name in the box first.", L"No name"); return; }
+    if (HasControlChars(GetText(r.user)) || HasControlChars(GetText(r.pass)) || HasControlChars(GetText(r.notes))) { WarnBadChars(L"Remove them and try again."); return; }
+    if (S.privPath.empty() || !FileExists(S.privPath)) {
+        Msg(L"Set the client or launcher location first: gear icon > Private Servers.", L"Private servers");
+        return;
+    }
+    SaveAccounts();
+    PidList base = GamePids(Snapshot());   // clients that are already running do not count
+    std::wstring cmd = L"\"" + S.privPath + L"\"";
+    if (!S.privFlags.empty()) cmd += L" " + S.privFlags;   // the flags are passed exactly as typed
+    size_t cut = S.privPath.find_last_of(L"\\/");   // the program starts in its own folder
+    std::wstring dir = (cut == std::wstring::npos) ? L"." : S.privPath.substr(0, cut);
+    std::vector<wchar_t> buf(cmd.begin(), cmd.end());
+    buf.push_back(0);
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    ZeroMemory(&si, sizeof(si));
+    ZeroMemory(&pi, sizeof(pi));
+    si.cb = sizeof(si);
+    if (!CreateProcessW(NULL, &buf[0], NULL, NULL, FALSE, 0, NULL, dir.c_str(), &si, &pi)) {
+        std::wstring m = L"The program could not be started (error " + std::to_wstring((long long)GetLastError()) + L").\n\nCheck the location on the Private Servers page.";
+        Msg(m.c_str(), L"Private servers");
+        return;
+    }
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    g_active.row = i;
+    g_active.priv = true;
+    g_active.phase = PH_WAITING;
+    g_priv.row = i;
+    g_priv.phase = PRV_CLIENT;
+    g_priv.start = GetTickCount();
+    g_priv.lastCheck = 0;
+    g_priv.windowSeen = 0;
+    g_priv.nextAt = 0;
+    g_priv.launchedPid = pi.dwProcessId;
+    g_priv.refocus = 0;
+    g_priv.hwnd = NULL;
+    g_priv.base = base;
+    g_priv.steps.clear();
+    g_priv.idx = 0;
+    SetSignText(i, L"CANCEL");
+    SetStatus(i, L"Program started - waiting for the game client", cWhite);
+    Log(L"---- SIGN IN (private server), row " + std::to_wstring((long long)(i + 1)) + L" ----");
+    Log(L"started the configured program (pid " + std::to_wstring((long long)pi.dwProcessId) + L")");
+    SetTimer(g_hwnd, ID_PRIVTIMER, 100, NULL);
+}
+
 static void StartPlay(int i) {
+    if (S.privateMode) { PrivatePlay(i); return; }   // private servers: a separate path, the Arc code below is not involved
     // Arc was already closed and we are only waiting for the game client: CANCEL stops waiting
     if (g_rows[i].pending) {
         g_rows[i].pending = false;
@@ -1035,6 +1345,7 @@ static void UpdateStateCore() {
     }
 
     if (g_active.row < 0) return;
+    if (g_active.priv) return;   // a private-server sign-in is handled by PrivateTick
     Active& a = g_active;
     Row& r = g_rows[a.row];
     double elapsed = (now - a.start) / 1000.0;
@@ -1096,9 +1407,11 @@ static void UpdateStateCore() {
     }
 }
 
+static void UpdateDeleteButtons();
 static void UpdateState() {
     UpdateStateCore();
     ExpireStatuses();
+    UpdateDeleteButtons();
     SaveSession();
     ApplyWindowTitles();
 }
@@ -1109,12 +1422,17 @@ static int g_bgW = 0, g_bgH = 0;
 static HBITMAP g_bgComposed = NULL;  // image laid out for the current window size, dimmed
 static int g_bgCW = 0, g_bgCH = 0;
 
-static HWND g_panel, g_btnAdd, g_btnShowPw, g_btnImport, g_btnExport, g_btnGear, g_btnLog, g_lblBlank, g_lblStorage;
+static HWND g_lblVersion;
+static bool g_hintScrolls = false;   // the plain-text warning is wider than its space and scrolls
+static HWND g_tipMain = NULL;   // tooltip control of the main window
+static void AddTip(HWND tt, HWND parent, HWND ctl, const wchar_t* text);
+static void DelTip(HWND tt, HWND parent, HWND ctl);
+static HWND g_panel, g_btnAdd, g_btnShowPw, g_btnImport, g_btnExport, g_btnMode, g_btnGear, g_btnLog, g_lblBlank, g_lblStorage;
 static int g_scroll = 0;
 static bool g_inLayout = false;
 
 static const int ROW_H = 40, ROW_TOP = 4, LIST_TOP = 80, BOTTOM_H = 52;
-static const int X_USER = 16, X_PASS = 223, X_NOTES = 430, X_SIGN = 637, X_STOP = 777, X_STATUS = 871, FIELD_W = 195;
+static const int X_UP = 8, X_DEL = 34, X_DOWN = 60, X_USER = 92, X_PASS = 299, X_NOTES = 506, X_SIGN = 713, X_STOP = 843, X_STATUS = 927, FIELD_W = 195, SIGN_W = 122, STOP_W = 76;   // (the fields keep their old width; the buttons gave back a few pixels)
 
 // paints the part of the background that lies behind rect rc of a window.
 // (ox, oy) = where that window's client origin sits inside the main window's client area.
@@ -1335,15 +1653,109 @@ static HWND MakeButton(HWND parent, int id, const wchar_t* text, int x, int y, i
     SendMessageW(c, WM_SETFONT, (WPARAM)g_fontBold, TRUE);
     return c;
 }
+// ---- the minus button of a row (grey, red when hovered; red with a ring when selected)
+static const wchar_t* const kDelTip =
+    L"CLICK to delete (with confirmation)\n"
+    L"SHIFT+CLICK to delete (without confirmation)\n"
+    L"CONTROL+CLICK to select several rows to delete,\n"
+    L"      then ALT+D to delete them\n"
+    L"Blank entries are also deleted on exit";
+static HWND g_hotDel = NULL;
+static LRESULT CALLBACK MinusProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    WNDPROC old = (WNDPROC)GetWindowLongPtrW(h, GWLP_USERDATA);
+    if (msg == WM_MOUSEMOVE && g_hotDel != h) {
+        g_hotDel = h;
+        TRACKMOUSEEVENT t;
+        ZeroMemory(&t, sizeof(t));
+        t.cbSize = sizeof(t);
+        t.dwFlags = TME_LEAVE;
+        t.hwndTrack = h;
+        TrackMouseEvent(&t);
+        InvalidateRect(h, NULL, FALSE);
+    } else if (msg == WM_MOUSELEAVE) {
+        if (g_hotDel == h) g_hotDel = NULL;
+        InvalidateRect(h, NULL, FALSE);
+    }
+    return CallWindowProcW(old, h, msg, wp, lp);
+}
+static void DrawMinusButton(const DRAWITEMSTRUCT* d) {   // also draws the up / down arrows
+    int row = ((int)d->CtlID - ID_ROW_BASE) / 10;
+    int kind = ((int)d->CtlID - ID_ROW_BASE) % 10;
+    bool arrow = (kind == K_UP || kind == K_DOWN);
+    bool selected = !arrow && row >= 0 && row < (int)g_rows.size() && g_rows[row].selected;
+    bool disabled = (d->itemState & ODS_DISABLED) != 0;
+    bool hot = (g_hotDel == d->hwndItem) && !disabled;
+    COLORREF fill = RGB(128, 128, 138);                    // grey
+    if (hot || selected) fill = arrow ? RGB(70, 125, 205) : RGB(215, 55, 55);   // arrows turn blue, the minus red
+    if (disabled) fill = RGB(72, 72, 80);
+    COLORREF bar = disabled ? RGB(112, 112, 120) : RGB(255, 255, 255);
+    RECT rc = d->rcItem;
+    int w = rc.right - rc.left, h = rc.bottom - rc.top;
+    const int K = 4;
+    HDC mem = CreateCompatibleDC(d->hDC);
+    HBITMAP bmp = CreateCompatibleBitmap(d->hDC, w * K, h * K);
+    HGDIOBJ oldBmp = SelectObject(mem, bmp);
+    RECT all = { 0, 0, w * K, h * K };
+    HBRUSH bgB = CreateSolidBrush(cBox);
+    FillRect(mem, &all, bgB);
+    HGDIOBJ oldPen = SelectObject(mem, GetStockObject(NULL_PEN));
+    int cx = w * K / 2, cy = h * K / 2, rad = (int)(std::min(w, h) * K * 0.40);
+    if (selected) {   // a white ring around the red disc
+        HBRUSH ringB = CreateSolidBrush(RGB(255, 255, 255));
+        HGDIOBJ ob = SelectObject(mem, ringB);
+        int rr = rad + K * 2;
+        Ellipse(mem, cx - rr, cy - rr, cx + rr, cy + rr);
+        SelectObject(mem, ob);
+        DeleteObject(ringB);
+    }
+    HBRUSH fillB = CreateSolidBrush(fill);
+    HGDIOBJ ob2 = SelectObject(mem, fillB);
+    Ellipse(mem, cx - rad, cy - rad, cx + rad, cy + rad);
+    SelectObject(mem, ob2);
+    HBRUSH barB = CreateSolidBrush(bar);
+    if (arrow) {   // a small triangle pointing up or down
+        HGDIOBJ ob3 = SelectObject(mem, barB);
+        int t = (int)(rad * 0.52), up = (kind == K_UP) ? -1 : 1;
+        POINT tri[3] = { { cx, cy + up * t }, { cx - t, cy - up * (int)(t * 0.6) }, { cx + t, cy - up * (int)(t * 0.6) } };
+        Polygon(mem, tri, 3);
+        SelectObject(mem, ob3);
+    } else {
+        RECT minus = { cx - (int)(rad * 0.58), cy - K, cx + (int)(rad * 0.58), cy + K };
+        FillRect(mem, &minus, barB);
+    }
+    SelectObject(mem, oldPen);
+    SetStretchBltMode(d->hDC, HALFTONE);
+    SetBrushOrgEx(d->hDC, 0, 0, NULL);
+    StretchBlt(d->hDC, rc.left, rc.top, w, h, mem, 0, 0, w * K, h * K, SRCCOPY);
+    SelectObject(mem, oldBmp);
+    DeleteObject(bmp);
+    DeleteObject(bgB);
+    DeleteObject(fillB);
+    DeleteObject(barB);
+    DeleteDC(mem);
+}
+
 static void AddRow(const Account& acc) {
     int i = (int)g_rows.size();
     Row r;
     r.user = MakeEdit(g_panel, RowId(i, K_USER), acc.user, L"Username", false);
     r.pass = MakeEdit(g_panel, RowId(i, K_PASS), acc.pass, L"Password", true);
     r.notes = MakeEdit(g_panel, RowId(i, K_NOTES), acc.notes, L"Main character", false);
-    r.sign = MakeButton(g_panel, RowId(i, K_SIGN), L"SIGN IN", 0, 0, 130, 28);
-    r.stop = MakeButton(g_panel, RowId(i, K_STOP), L"STOP", 0, 0, 84, 28);
+    r.sign = MakeButton(g_panel, RowId(i, K_SIGN), L"SIGN IN", 0, 0, SIGN_W, 28);
+    r.stop = MakeButton(g_panel, RowId(i, K_STOP), L"STOP", 0, 0, STOP_W, 28);
     r.status = MakeLabel(g_panel, RowId(i, K_STATUS), L"Idle", 0, 0, 300, 22);
+    r.up = MakeButton(g_panel, RowId(i, K_UP), L"", 0, 0, 24, 24);
+    r.down = MakeButton(g_panel, RowId(i, K_DOWN), L"", 0, 0, 24, 24);
+    r.del = MakeButton(g_panel, RowId(i, K_DEL), L"", 0, 0, 24, 24);
+    HWND tools[3] = { r.up, r.del, r.down };
+    for (int k = 0; k < 3; k++) {
+        SetWindowLongPtrW(tools[k], GWL_STYLE, GetWindowLongPtrW(tools[k], GWL_STYLE) & ~(LONG_PTR)WS_TABSTOP);   // not reachable with the Tab key
+        WNDPROC oldTool = (WNDPROC)SetWindowLongPtrW(tools[k], GWLP_WNDPROC, (LONG_PTR)MinusProc);
+        SetWindowLongPtrW(tools[k], GWLP_USERDATA, (LONG_PTR)oldTool);
+    }
+    if (g_tipMain) { AddTip(g_tipMain, g_hwnd, r.up, L"Move this account up"); AddTip(g_tipMain, g_hwnd, r.down, L"Move this account down"); }
+    if (g_tipMain) AddTip(g_tipMain, g_hwnd, r.del, kDelTip);
+    r.selected = false;
     GuardEdit(r.user);
     GuardEdit(r.pass);
     GuardEdit(r.notes);
@@ -1378,8 +1790,8 @@ static void UpdateScroll() {
 static void LayoutRows() {
     RECT pc;
     GetClientRect(g_panel, &pc);
-    int statusW = std::max(120, (int)pc.right - X_STATUS - 12);
-    HDWP dwp = BeginDeferWindowPos((int)g_rows.size() * 6 + 1);
+    int statusW = std::max(80, (int)pc.right - X_STATUS - 12);
+    HDWP dwp = BeginDeferWindowPos((int)g_rows.size() * 9 + 1);
     const UINT f = SWP_NOZORDER | SWP_NOACTIVATE;
     for (size_t i = 0; i < g_rows.size() && dwp; i++) {
         int y = ROW_TOP + (int)i * ROW_H - g_scroll;
@@ -1387,9 +1799,12 @@ static void LayoutRows() {
         dwp = DeferWindowPos(dwp, r.user, NULL, X_USER, y, FIELD_W, 26, f);
         if (dwp) dwp = DeferWindowPos(dwp, r.pass, NULL, X_PASS, y, FIELD_W, 26, f);
         if (dwp) dwp = DeferWindowPos(dwp, r.notes, NULL, X_NOTES, y, FIELD_W, 26, f);
-        if (dwp) dwp = DeferWindowPos(dwp, r.sign, NULL, X_SIGN, y - 1, 130, 28, f);
-        if (dwp) dwp = DeferWindowPos(dwp, r.stop, NULL, X_STOP, y - 1, 84, 28, f);
+        if (dwp) dwp = DeferWindowPos(dwp, r.sign, NULL, X_SIGN, y - 1, SIGN_W, 28, f);
+        if (dwp) dwp = DeferWindowPos(dwp, r.stop, NULL, X_STOP, y - 1, STOP_W, 28, f);
         if (dwp) dwp = DeferWindowPos(dwp, r.status, NULL, X_STATUS, y + 4, statusW, 22, f | SWP_NOCOPYBITS);
+        if (dwp) dwp = DeferWindowPos(dwp, r.del, NULL, X_DEL, y + 1, 24, 24, f);
+        if (dwp) dwp = DeferWindowPos(dwp, r.up, NULL, X_UP, y + 1, 24, 24, f);
+        if (dwp) dwp = DeferWindowPos(dwp, r.down, NULL, X_DOWN, y + 1, 24, 24, f);
     }
     if (dwp) EndDeferWindowPos(dwp);
 }
@@ -1428,10 +1843,13 @@ static void LayoutMain() {
     const UINT f = SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS;
     SetWindowPos(g_btnAdd, NULL, 16, by, 120, 28, f);
     SetWindowPos(g_btnShowPw, NULL, 150, by + 4, 130, 22, f);
+    if (g_btnMode) SetWindowPos(g_btnMode, NULL, std::max(230, (cw - 240) / 2), 12, 240, 40, f);
     if (g_btnImport) SetWindowPos(g_btnImport, NULL, 292, by, 80, 28, f);
     if (g_btnExport) SetWindowPos(g_btnExport, NULL, 378, by, 80, 28, f);
     SetWindowPos(g_lblBlank, NULL, 472, by + 6, 200, 20, f);
-    if (g_lblStorage) SetWindowPos(g_lblStorage, NULL, 676, by + 6, std::max(100, cw - 676 - 16 - 80), 20, f);
+    int verLeft = cw - 206;   // the version number sits left of the paper and gear buttons
+    if (g_lblVersion) SetWindowPos(g_lblVersion, NULL, verLeft, by + 6, 110, 20, f);
+    if (g_lblStorage) SetWindowPos(g_lblStorage, NULL, 676, by + 6, std::max(60, verLeft - 12 - 676), 20, f);
     if (g_btnGear) SetWindowPos(g_btnGear, NULL, cw - 16 - 28, by, 28, 28, f);
     if (g_btnLog) SetWindowPos(g_btnLog, NULL, cw - 16 - 28 - 8 - 28, by, 28, 28, f);
 }
@@ -1446,6 +1864,16 @@ static HWND MakeTooltips(HWND parent) {
         SendMessageW(tt, TTM_SETDELAYTIME, TTDT_AUTOPOP, 20000);
     }
     return tt;
+}
+static void DelTip(HWND tt, HWND parent, HWND ctl) {
+    if (!tt || !ctl) return;
+    TOOLINFOW ti;
+    ZeroMemory(&ti, sizeof(ti));
+    ti.cbSize = TOOLINFO_V1_SIZE;
+    ti.uFlags = TTF_IDISHWND;
+    ti.hwnd = parent;
+    ti.uId = (UINT_PTR)ctl;
+    SendMessageW(tt, TTM_DELTOOLW, 0, (LPARAM)&ti);
 }
 static void AddTip(HWND tt, HWND parent, HWND ctl, const wchar_t* text) {
     if (!tt || !ctl) return;
@@ -1562,6 +1990,38 @@ static LRESULT CALLBACK HoverProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     return CallWindowProcW(old, h, msg, wp, lp);
 }
 
+// ---- the OFFICIAL | PRIVATE switch at the top of the main window
+static void DrawModeSwitch(const DRAWITEMSTRUCT* d) {
+    HDC dc = d->hDC;
+    RECT rc = d->rcItem;
+    int half = (rc.right - rc.left) / 2, mid = (rc.top + rc.bottom) / 2;
+    RECT l = { rc.left, rc.top, rc.left + half, rc.bottom };
+    RECT rr = { rc.left + half, rc.top, rc.right, rc.bottom };
+    HBRUSH b1 = CreateSolidBrush(S.privateMode ? cBox : RGB(55, 95, 155));
+    FillRect(dc, &l, b1);
+    DeleteObject(b1);
+    HBRUSH b2 = CreateSolidBrush(S.privateMode ? RGB(190, 105, 35) : cBox);
+    FillRect(dc, &rr, b2);
+    DeleteObject(b2);
+    HBRUSH fr = CreateSolidBrush(cGray);
+    FrameRect(dc, &rc, fr);
+    DeleteObject(fr);
+    SetBkMode(dc, TRANSPARENT);
+    // each side: the name on top, the word "Servers" tightly under it
+    RECT l1 = { l.left, rc.top, l.right, mid + 1 }, l2 = { l.left, mid, l.right, rc.bottom };
+    RECT r1 = { rr.left, rc.top, rr.right, mid + 1 }, r2 = { rr.left, mid, rr.right, rc.bottom };
+    SelectObject(dc, g_fontBold);
+    SetTextColor(dc, S.privateMode ? cGray : cWhite);
+    DrawTextW(dc, L"OFFICIAL", -1, &l1, DT_CENTER | DT_BOTTOM | DT_SINGLELINE);
+    SetTextColor(dc, S.privateMode ? cWhite : cGray);
+    DrawTextW(dc, L"PRIVATE", -1, &r1, DT_CENTER | DT_BOTTOM | DT_SINGLELINE);
+    SelectObject(dc, g_font);
+    SetTextColor(dc, S.privateMode ? cGray : cWhite);
+    DrawTextW(dc, L"Servers", -1, &l2, DT_CENTER | DT_TOP | DT_SINGLELINE);
+    SetTextColor(dc, S.privateMode ? cWhite : cGray);
+    DrawTextW(dc, L"Servers", -1, &r2, DT_CENTER | DT_TOP | DT_SINGLELINE);
+}
+
 // ---- owner-drawn controls. Labels paint their own slice of the background, so text sits cleanly on the image.
 static void DrawLabel(const DRAWITEMSTRUCT* d) {
     int id = (int)d->CtlID;
@@ -1578,6 +2038,7 @@ static void DrawLabel(const DRAWITEMSTRUCT* d) {
 
     COLORREF col = cGray;
     HFONT font = g_font;
+    if (id == ID_STORAGEHINT) col = cAmber;
     if (id == ID_TITLE) { col = cWhite; font = g_fontTitle; }
     else if (id >= ID_ROW_BASE && (id - ID_ROW_BASE) % 10 == K_STATUS) {
         int ri = (id - ID_ROW_BASE) / 10;
@@ -1588,7 +2049,21 @@ static void DrawLabel(const DRAWITEMSTRUCT* d) {
     SelectObject(mem, font);
     SetBkMode(mem, TRANSPARENT);
     SetTextColor(mem, col);
-    DrawTextW(mem, txt, -1, &r0, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+    SIZE tsz = { 0, 0 };
+    GetTextExtentPoint32W(mem, txt, lstrlenW(txt), &tsz);
+    if (id == ID_STORAGEHINT && tsz.cx > w) {   // too wide: scroll it (the timer repaints it)
+        g_hintScrolls = true;
+        int period = tsz.cx + 60;
+        int off = (int)((GetTickCount() / 25) % (DWORD)period);
+        RECT t1 = { -off, 0, -off + tsz.cx + 10, h };
+        RECT t2 = { -off + period, 0, -off + period + tsz.cx + 10, h };
+        DrawTextW(mem, txt, -1, &t1, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        DrawTextW(mem, txt, -1, &t2, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    } else {
+        if (id == ID_STORAGEHINT) g_hintScrolls = false;
+        UINT fmt = (id == ID_VERSION) ? DT_RIGHT : DT_LEFT;
+        DrawTextW(mem, txt, -1, &r0, fmt | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+    }
     BitBlt(d->hDC, rc.left, rc.top, w, h, mem, 0, 0, SRCCOPY);
     SelectObject(mem, old);
     DeleteObject(bmp);
@@ -1604,6 +2079,8 @@ static void DrawButton(const DRAWITEMSTRUCT* d) {
     wchar_t txt[64];
     GetWindowTextW(d->hwndItem, txt, 64);
     if (id == ID_GEAR || id == ID_LOG) { DrawGearButton(d); return; }
+    if (id >= ID_ROW_BASE && ((id - ID_ROW_BASE) % 10 == K_DEL || (id - ID_ROW_BASE) % 10 == K_UP || (id - ID_ROW_BASE) % 10 == K_DOWN)) { DrawMinusButton(d); return; }
+    if (id == ID_MODE) { DrawModeSwitch(d); return; }
     if (id == ID_SHOWPW) {
         int w = rc.right - rc.left, h = rc.bottom - rc.top;
         HDC mem = CreateCompatibleDC(dc);
@@ -1718,21 +2195,24 @@ enum {
     ID_S_CLOSE_LAUNCHER, ID_S_CLOSE_GAME, ID_S_LGRACE, ID_S_GRACE, ID_S_TIMEOUT, ID_S_PENDING,
     ID_S_CONFIRM, ID_S_KILL, ID_S_DEBUG, ID_S_RENAME, ID_S_STORAGE, ID_S_RENDUR, ID_S_STATRESET,
     ID_S_BG, ID_S_BGBROWSE, ID_S_MODE0, ID_S_MODE1, ID_S_MODE2, ID_S_MODE3, ID_S_MODE4,
-    ID_S_DIM, ID_S_DIMLBL, ID_S_DEFAULTS, ID_S_SAVE, ID_S_CANCEL, ID_S_PAGE_BASIC, ID_S_PAGE_ADV, ID_S_FOLDER
+    ID_S_DIM, ID_S_DIMLBL, ID_S_DEFAULTS, ID_S_SAVE, ID_S_CANCEL, ID_S_PAGE_BASIC, ID_S_PAGE_ADV, ID_S_PAGE_PRIV, ID_S_FOLDER,
+    ID_S_PRIV_PATH, ID_S_PRIV_PATHBROWSE, ID_S_PRIV_FLAGS, ID_S_PRIV_WARN, ID_S_PRIV_PROCS, ID_S_PRIV_WINWAIT, ID_S_PRIV_FIRSTKEY,
+    ID_S_PRIV_ENTERS, ID_S_PRIV_PAUSEPOP, ID_S_PRIV_PAUSESTEP, ID_S_PRIV_TABS, ID_S_PRIV_CLEAR, ID_S_PRIV_ENTERAFTER,
+    ID_S_PRIV_KEY_ENTER, ID_S_PRIV_KEY_ESC,
+    ID_S_POP_COUNT, ID_S_POP_PAUSE, ID_S_POP_CLEAR, ID_S_POP_ENTERAFTER, ID_S_POP_KEY_ENTER, ID_S_POP_KEY_ESC
 };
 
 static HWND g_setWnd = NULL;       // the settings window (NULL while closed)
-static std::vector<HWND> g_pageBasic, g_pageAdv;       // the controls of the two pages (Basic / Advanced)
+static std::vector<HWND> g_pageBasic, g_pageAdv, g_pagePriv;       // the controls of the two pages (Basic / Advanced)
 static std::vector<HWND>* g_pageList = NULL;           // while building: which page the new controls belong to
 static HWND g_setTip = NULL;
-static HWND g_tipMain = NULL;      // tooltip control of the main window
 static bool g_setDirty = false;    // something was changed and not saved yet
 static bool g_setLoading = false;  // true while the controls are being filled in by the program
 
 // whole-number settings: text boxes in the window
 struct NumField { int id; const wchar_t* key; const wchar_t* label; int Settings::* mem; int minV, maxV; };
 static const NumField kNumFields[] = {
-    { ID_S_W,          L"WindowWidth",          L"Window width",                 &Settings::windowWidth,          900, 7680 },
+    { ID_S_W,          L"WindowWidth",          L"Window width",                 &Settings::windowWidth,          1040, 7680 },
     { ID_S_H,          L"WindowHeight",         L"Window height",                &Settings::windowHeight,         420, 4320 },
     { ID_S_UTABS,      L"UsernameFocusTabs",    L"Tabs before username box",     &Settings::usernameFocusTabs,    0,   20 },
     { ID_S_FTABS,      L"FieldSeparatorTabs",   L"Tabs between the two boxes",   &Settings::fieldSeparatorTabs,   0,   20 },
@@ -1745,6 +2225,18 @@ static const NumField kNumFields[] = {
     { ID_S_PENDING,    L"PendingTimeoutSeconds", L"Game wait after close (seconds)", &Settings::pendingTimeoutSeconds, 10, 86400 },
     { ID_S_RENDUR,     L"RenameDurationSeconds", L"Rename duration (seconds)",   &Settings::renameDurationSeconds, 10, 3600 },
     { ID_S_STATRESET,  L"StatusResetSeconds",    L"Reset status after (seconds)", &Settings::statusResetSeconds, 0, 86400 },
+    // private servers (index 13 and up)
+    { ID_S_PRIV_WINWAIT,   L"PrivateWindowWaitSeconds",    L"Wait for the game window (sec)", &Settings::privWindowWait,   1, 3600 },
+    { ID_S_PRIV_FIRSTKEY,  L"PrivateFirstKeyDelaySeconds", L"Wait before the first key (sec)", &Settings::privFirstKey,   0, 600 },
+    { ID_S_PRIV_ENTERS,    L"PrivateEntersBefore",         L"Enter/Escape presses for the pop-up",   &Settings::privEnters,       0, 10 },
+    { ID_S_PRIV_PAUSEPOP,  L"PrivatePauseAfterPopupMs",    L"Pause after the pop-up (ms)",    &Settings::privPausePopup,   0, 60000 },
+    { ID_S_PRIV_PAUSESTEP, L"PrivatePauseStepMs",          L"Pause between steps (ms)",       &Settings::privPauseStep,    0, 60000 },
+    { ID_S_PRIV_TABS,      L"PrivateTabs",                 L"Tabs between the two boxes",     &Settings::privTabs,         0, 10 },
+    { ID_S_PRIV_CLEAR,     L"PrivateClearBackspaces",      L"Backspaces to clear a box",      &Settings::privClear,        0, 60 },
+    // login pop-up and typing for the official game (index 20 and up)
+    { ID_S_POP_COUNT,      L"EntersBefore",                L"Enter/Escape presses for the pop-up", &Settings::popPresses,  0, 10 },
+    { ID_S_POP_PAUSE,      L"PauseAfterPopupMs",           L"Pause after the pop-up (ms)",    &Settings::popPause,         0, 60000 },
+    { ID_S_POP_CLEAR,      L"ClearBackspaces",             L"Backspaces to clear a box",      &Settings::clearBs,          0, 60 },
 };
 // on/off settings: tick boxes in the window
 struct BoolField { int id; const wchar_t* key; bool Settings::* mem; };
@@ -1756,6 +2248,9 @@ static const BoolField kBoolFields[] = {
     { ID_S_DEBUG,    L"DebugLog",           &Settings::debugLog },
     { ID_S_RENAME,   L"RenameGameWindows",  &Settings::renameWindows },
     { ID_S_STORAGE,  L"ShowStorageHint",    &Settings::showStorageHint },
+    { ID_S_PRIV_ENTERAFTER, L"PrivateEnterAfterPassword", &Settings::privEnterAfter },
+    { ID_S_PRIV_WARN, L"PrivateShowWarning", &Settings::privShowWarning },
+    { ID_S_POP_ENTERAFTER, L"EnterAfterPassword", &Settings::enterAfterPw },
 };
 static const wchar_t* const kModeNames[5]  = { L"fill", L"fit", L"stretch", L"tile", L"center" };
 static const wchar_t* const kModeLabels[5] = { L"Fill", L"Fit", L"Stretch", L"Tile", L"Center" };
@@ -1764,7 +2259,8 @@ static HWND SCtl(int id) { return GetDlgItem(g_setWnd, id); }
 static void ShowSettingsPage(int page) {
     for (size_t i = 0; i < g_pageBasic.size(); i++) ShowWindow(g_pageBasic[i], page == 0 ? SW_SHOW : SW_HIDE);
     for (size_t i = 0; i < g_pageAdv.size(); i++) ShowWindow(g_pageAdv[i], page == 1 ? SW_SHOW : SW_HIDE);
-    CheckRadioButton(g_setWnd, ID_S_PAGE_BASIC, ID_S_PAGE_ADV, page == 0 ? ID_S_PAGE_BASIC : ID_S_PAGE_ADV);
+    for (size_t i = 0; i < g_pagePriv.size(); i++) ShowWindow(g_pagePriv[i], page == 2 ? SW_SHOW : SW_HIDE);
+    CheckRadioButton(g_setWnd, ID_S_PAGE_BASIC, ID_S_PAGE_PRIV, page == 0 ? ID_S_PAGE_BASIC : (page == 1 ? ID_S_PAGE_ADV : ID_S_PAGE_PRIV));
 }
 static HWND SMake(const wchar_t* cls, const wchar_t* text, DWORD style, DWORD ex, int x, int y, int w, int h, int id) {
     HWND c = CreateWindowExW(ex, cls, text, WS_CHILD | WS_VISIBLE | style, x, y, w, h, g_setWnd, (HMENU)(INT_PTR)id, g_hInst, NULL);
@@ -1795,23 +2291,36 @@ static void UpdateDimLabel() {
 }
 // greys out the boxes that do not matter for the current choices
 static void SettingsUpdateEnabled() {
+    bool priv = S.privateMode;   // private server mode: the Arc settings are not used, so they are greyed out
     bool af = Checked(ID_S_AUTOFILL);
     const int fillIds[] = { ID_S_UTABS, ID_S_FTABS, ID_S_LOGINMS, ID_S_MINWAIT, ID_S_WINTIMEOUT };
-    for (size_t i = 0; i < sizeof(fillIds) / sizeof(fillIds[0]); i++) EnableWindow(SCtl(fillIds[i]), af);
+    for (size_t i = 0; i < sizeof(fillIds) / sizeof(fillIds[0]); i++) EnableWindow(SCtl(fillIds[i]), af && !priv);
     bool launcher = Checked(ID_S_CLOSE_LAUNCHER);
-    EnableWindow(SCtl(ID_S_LGRACE), launcher);
-    EnableWindow(SCtl(ID_S_PENDING), launcher);
-    EnableWindow(SCtl(ID_S_GRACE), !launcher);
+    EnableWindow(SCtl(ID_S_LGRACE), launcher && !priv);
+    EnableWindow(SCtl(ID_S_PENDING), launcher && !priv);
+    EnableWindow(SCtl(ID_S_GRACE), !launcher && !priv);
+    EnableWindow(SCtl(ID_S_TIMEOUT), !priv);
     EnableWindow(SCtl(ID_S_RENDUR), Checked(ID_S_RENAME));
+    const int popIds[] = { ID_S_POP_COUNT, ID_S_POP_PAUSE, ID_S_POP_CLEAR, ID_S_POP_ENTERAFTER, ID_S_POP_KEY_ENTER, ID_S_POP_KEY_ESC };
+    for (size_t i = 0; i < sizeof(popIds) / sizeof(popIds[0]); i++) EnableWindow(SCtl(popIds[i]), af && !priv);
+    EnableWindow(SCtl(ID_S_ARC), !priv);
+    EnableWindow(SCtl(ID_S_ARCBROWSE), !priv);
+    EnableWindow(SCtl(ID_S_CLOSE_LAUNCHER), !priv);
+    EnableWindow(SCtl(ID_S_CLOSE_GAME), !priv);
+    EnableWindow(SCtl(ID_S_KILL), !priv);
 }
-// fills the window from a Settings value
 static void SettingsToUi(const Settings& v) {
     g_setLoading = true;
     SetWindowTextW(SCtl(ID_S_ARC), v.arcPath.c_str());
+    SetWindowTextW(SCtl(ID_S_PRIV_PATH), v.privPath.c_str());
+    SetWindowTextW(SCtl(ID_S_PRIV_FLAGS), v.privFlags.c_str());
+    SetWindowTextW(SCtl(ID_S_PRIV_PROCS), v.privProcNames.c_str());
     for (size_t i = 0; i < sizeof(kNumFields) / sizeof(kNumFields[0]); i++)
         SetWindowTextW(SCtl(kNumFields[i].id), std::to_wstring((long long)(v.*(kNumFields[i].mem))).c_str());
     for (size_t i = 0; i < sizeof(kBoolFields) / sizeof(kBoolFields[0]); i++)
         SendMessageW(SCtl(kBoolFields[i].id), BM_SETCHECK, (v.*(kBoolFields[i].mem)) ? BST_CHECKED : BST_UNCHECKED, 0);
+    CheckRadioButton(g_setWnd, ID_S_PRIV_KEY_ENTER, ID_S_PRIV_KEY_ESC, v.privPopupEsc ? ID_S_PRIV_KEY_ESC : ID_S_PRIV_KEY_ENTER);
+    CheckRadioButton(g_setWnd, ID_S_POP_KEY_ENTER, ID_S_POP_KEY_ESC, v.popEsc ? ID_S_POP_KEY_ESC : ID_S_POP_KEY_ENTER);
     CheckRadioButton(g_setWnd, ID_S_CLOSE_LAUNCHER, ID_S_CLOSE_GAME, v.closeAtLauncher ? ID_S_CLOSE_LAUNCHER : ID_S_CLOSE_GAME);
     SetWindowTextW(SCtl(ID_S_BG), v.bgImage.c_str());
     int mode = 0;
@@ -1837,6 +2346,13 @@ static bool UiToSettings(Settings& n) {
         return false;
     }
     n.arcPath = arc;
+    n.privPath = Trim(GetText(SCtl(ID_S_PRIV_PATH)));
+    n.privFlags = Trim(GetText(SCtl(ID_S_PRIV_FLAGS)));
+    n.privProcNames = Trim(GetText(SCtl(ID_S_PRIV_PROCS)));
+    if (n.privProcNames.empty()) {
+        SettingsWarn(L"Enter at least one process name for the game client (for example elementclient.exe).", ID_S_PRIV_PROCS);
+        return false;
+    }
     for (size_t i = 0; i < sizeof(kNumFields) / sizeof(kNumFields[0]); i++) {
         const NumField& f = kNumFields[i];
         std::wstring t = Trim(GetText(SCtl(f.id)));
@@ -1852,6 +2368,8 @@ static bool UiToSettings(Settings& n) {
     }
     for (size_t i = 0; i < sizeof(kBoolFields) / sizeof(kBoolFields[0]); i++) n.*(kBoolFields[i].mem) = Checked(kBoolFields[i].id);
     n.closeAtLauncher = Checked(ID_S_CLOSE_LAUNCHER);
+    n.privPopupEsc = Checked(ID_S_PRIV_KEY_ESC);
+    n.popEsc = Checked(ID_S_POP_KEY_ESC);
     std::wstring bg = Trim(GetText(SCtl(ID_S_BG)));
     if (!bg.empty() && !FileExists(bg)) {
         SettingsWarn(L"The background image file was not found:\n" + bg + L"\n\nFix the path, or clear the box to use the default background.", ID_S_BG);
@@ -1876,9 +2394,14 @@ static std::wstring DimText(double dim) {
 // writes every setting that has a box in the window; comments and other lines in the file stay as they are
 static bool WriteSettingsToIni(const Settings& s) {
     bool ok = IniPutStr(L"ArcPath", s.arcPath);
+    ok = IniPutStr(L"PrivateClientPath", s.privPath) && ok;
+    ok = IniPutStr(L"PrivateFlags", s.privFlags) && ok;
+    ok = IniPutStr(L"PrivateProcessNames", s.privProcNames) && ok;
     for (size_t i = 0; i < sizeof(kNumFields) / sizeof(kNumFields[0]); i++) ok = IniPutInt(kNumFields[i].key, s.*(kNumFields[i].mem)) && ok;
     for (size_t i = 0; i < sizeof(kBoolFields) / sizeof(kBoolFields[0]); i++) ok = IniPutInt(kBoolFields[i].key, (s.*(kBoolFields[i].mem)) ? 1 : 0) && ok;
     ok = IniPutStr(L"CloseArcAt", s.closeAtLauncher ? L"launcher" : L"game") && ok;
+    ok = IniPutStr(L"PrivatePopupKey", s.privPopupEsc ? L"escape" : L"enter") && ok;
+    ok = IniPutStr(L"PopupKey", s.popEsc ? L"escape" : L"enter") && ok;
     ok = IniPutStr(L"BackgroundImage", s.bgImage) && ok;
     ok = IniPutStr(L"BackgroundMode", s.bgMode) && ok;
     ok = IniPutStr(L"BackgroundDim", DimText(s.bgDim)) && ok;
@@ -1969,14 +2492,17 @@ static void BrowseInto(int editId, const wchar_t* filter, const wchar_t* title) 
 static void BuildSettingsWindow() {
     g_pageBasic.clear();
     g_pageAdv.clear();
+    g_pagePriv.clear();
     g_pageList = NULL;
     g_setTip = MakeTooltips(g_setWnd);
-    HWND title = SLabel(L"CONFIGURATION", 16, 8, 400, 36);
+    HWND title = SLabel(L"CONFIGURATION", 16, 8, 250, 36);
     SendMessageW(title, WM_SETFONT, (WPARAM)g_fontTitle, TRUE);
     // two push-like radio buttons switch between the pages
-    SMake(L"BUTTON", L"Basic", BS_AUTORADIOBUTTON | BS_PUSHLIKE | WS_GROUP | WS_TABSTOP, 0, 440, 14, 90, 26, ID_S_PAGE_BASIC);
-    SMake(L"BUTTON", L"Advanced", BS_AUTORADIOBUTTON | BS_PUSHLIKE, 0, 534, 14, 90, 26, ID_S_PAGE_ADV);
+    SMake(L"BUTTON", L"Basic", BS_AUTORADIOBUTTON | BS_PUSHLIKE | WS_GROUP | WS_TABSTOP, 0, 276, 14, 70, 26, ID_S_PAGE_BASIC);
+    SMake(L"BUTTON", L"Advanced", BS_AUTORADIOBUTTON | BS_PUSHLIKE, 0, 350, 14, 84, 26, ID_S_PAGE_ADV);
+    SMake(L"BUTTON", L"Private Servers", BS_AUTORADIOBUTTON | BS_PUSHLIKE, 0, 438, 14, 186, 26, ID_S_PAGE_PRIV);
 
+    g_pageList = &g_pageBasic;   // the Arc location is part of the Basic page only
     SLabel(L"Arc Location", 16, 52, 300, 18);
     SEdit(ID_S_ARC, 16, 72, 520, 22, false, false);
     SButton(ID_S_ARCBROWSE, L"Browse...", 544, 71, 80, 24, false);
@@ -2034,22 +2560,78 @@ static void BuildSettingsWindow() {
         SLabel(kNumFields[7 + i].label, 344, y + 3, 210, 18);
         SEdit(closeIds[i], 556, y, 56, 22, true, false);
     }
+    SGroup(L"Login pop-up and typing", 16, 342, 608, 104);
+    SLabel(kNumFields[20].label, 28, 369, 235, 18); SEdit(ID_S_POP_COUNT, 270, 366, 50, 22, true, false);
+    SLabel(L"Key for the pop-up", 28, 395, 120, 18);
+    SRadio(ID_S_POP_KEY_ENTER, L"Enter", 160, 392, 70, 20, true);
+    SRadio(ID_S_POP_KEY_ESC, L"Escape", 240, 392, 72, 20, false);
+    SLabel(kNumFields[21].label, 28, 421, 235, 18); SEdit(ID_S_POP_PAUSE, 270, 418, 50, 22, true, true);   // (ends the radio group)
+    SLabel(kNumFields[22].label, 344, 369, 210, 18); SEdit(ID_S_POP_CLEAR, 566, 366, 50, 22, true, false);
+    SCheck(ID_S_POP_ENTERAFTER, L"Press Enter after the password", 344, 394, 270, 20);
+    // ======== page 3: Private Servers
+    g_pageList = &g_pagePriv;
+    SLabel(L"Used while the switch at the top of the main window is set to Private Servers. Arc is not used in that mode.", 16, 108, 608, 18);
+    SGroup(L"Program to start", 16, 134, 608, 120);
+    SLabel(L"Client or launcher location (it starts in its own folder)", 28, 156, 400, 18);
+    SEdit(ID_S_PRIV_PATH, 28, 176, 496, 22, false, false);
+    SButton(ID_S_PRIV_PATHBROWSE, L"Browse...", 532, 175, 80, 24, false);
+    SLabel(L"Command-line flags (example: game:cpw nocheck startbypatcher console:1)", 28, 204, 580, 18);
+    SEdit(ID_S_PRIV_FLAGS, 28, 224, 584, 22, false, false);
+    SGroup(L"Game client", 16, 262, 300, 180);
+    SLabel(L"Process name(s) to wait for (use commas)", 28, 284, 280, 18);
+    SEdit(ID_S_PRIV_PROCS, 28, 304, 272, 22, false, false);
+    SLabel(kNumFields[13].label, 28, 342, 205, 18); SEdit(ID_S_PRIV_WINWAIT, 240, 339, 58, 22, true, false);
+    SLabel(kNumFields[14].label, 28, 370, 205, 18); SEdit(ID_S_PRIV_FIRSTKEY, 240, 367, 58, 22, true, false);
+    SCheck(ID_S_PRIV_ENTERAFTER, L"Press Enter after the password", 28, 396, 270, 20);
+    SGroup(L"Typing sequence", 332, 262, 292, 180);
+    SLabel(kNumFields[15].label, 344, 289, 220, 18); SEdit(ID_S_PRIV_ENTERS, 566, 286, 50, 22, true, false);
+    SLabel(L"Key for the pop-up", 344, 317, 120, 18);
+    SRadio(ID_S_PRIV_KEY_ENTER, L"Enter", 470, 314, 70, 20, true);
+    SRadio(ID_S_PRIV_KEY_ESC, L"Escape", 544, 314, 72, 20, false);
+    const int typIds[4] = { ID_S_PRIV_PAUSEPOP, ID_S_PRIV_PAUSESTEP, ID_S_PRIV_TABS, ID_S_PRIV_CLEAR };
+    for (int i = 0; i < 4; i++) {
+        int y = 338 + i * 26;
+        SLabel(kNumFields[16 + i].label, 344, y + 3, 220, 18);
+        SEdit(typIds[i], 566, y, 50, 22, true, i == 0);   // (the first one ends the radio group)
+    }
+    SCheck(ID_S_PRIV_WARN, L"Show a warning when switching to Private Servers", 150, 452, 340, 20);   // centered
     g_pageList = NULL;
 
     // ======== buttons (always visible)
-    SButton(ID_S_DEFAULTS, L"LOAD DEFAULTS", 16, 446, 130, 28, false);
-    SButton(ID_S_FOLDER, L"OPEN SETTINGS FOLDER", 154, 446, 176, 28, false);
-    SButton(ID_S_SAVE, L"SAVE CONFIGURATION", 338, 446, 184, 28, true);
-    SButton(ID_S_CANCEL, L"CANCEL", 530, 446, 94, 28, false);
-    SMake(L"STATIC", (L"Settings file: " + g_iniPath).c_str(), SS_LEFT | SS_NOPREFIX | SS_PATHELLIPSIS, 0, 16, 486, 440, 16, -1);
-    SMake(L"STATIC", (std::wstring(kAppVersion) + L" (C++)").c_str(), SS_RIGHT | SS_NOPREFIX, 0, 464, 486, 160, 16, -1);
+    SButton(ID_S_DEFAULTS, L"LOAD DEFAULTS", 16, 480, 130, 28, false);
+    SButton(ID_S_FOLDER, L"OPEN SETTINGS FOLDER", 154, 480, 176, 28, false);
+    SButton(ID_S_SAVE, L"SAVE CONFIGURATION", 338, 480, 184, 28, true);
+    SButton(ID_S_CANCEL, L"CANCEL", 530, 480, 94, 28, false);
+    SMake(L"STATIC", (L"Settings file: " + g_iniPath).c_str(), SS_LEFT | SS_NOPREFIX | SS_PATHELLIPSIS, 0, 16, 520, 440, 16, -1);
+    SMake(L"STATIC", L"\u00A9 2026 Sparc343", SS_RIGHT | SS_NOPREFIX, 0, 464, 520, 160, 16, -1);
 
     // hover hints
     Tip(ID_S_PAGE_BASIC, L"The settings most people use.");
     Tip(ID_S_PAGE_ADV, L"Timing and fine-tuning. The defaults suit most computers.");
+    Tip(ID_S_PAGE_PRIV, L"Settings for private servers (game servers that do not use Arc).");
+    Tip(ID_S_PRIV_PATH, L"The game client (elementclient.exe) or the launcher / patcher of the private server. It is started with administrator rights.");
+    Tip(ID_S_PRIV_FLAGS, L"Command-line flags, passed exactly as typed. Never put your password here.");
+    Tip(ID_S_PRIV_WARN, L"Show a warning every time you switch the main window to Private Servers.");
+    Tip(ID_S_PRIV_PROCS, L"The real game client. If you start a launcher or patcher, the manager waits until one of these processes appears.");
+    Tip(ID_S_PRIV_WINWAIT, L"Give up if the game client and its window have not appeared after this many seconds. Raise it if the server patches first.");
+    Tip(ID_S_PRIV_FIRSTKEY, L"After the game window appears, wait this long before the first key is pressed.");
+    Tip(ID_S_PRIV_ENTERS, L"How many times the key below is pressed first, for the message that appears before the login page (0 = none).");
+    Tip(ID_S_PRIV_KEY_ENTER, L"Clear the start-up pop-up of the client with the Enter key.");
+    Tip(ID_S_PRIV_KEY_ESC, L"Clear the start-up pop-up of the client with the Escape key (some private servers need this).");
+    Tip(ID_S_PRIV_PAUSEPOP, L"Pause after the last of those Enter presses, so the login page can appear.");
+    Tip(ID_S_PRIV_PAUSESTEP, L"Pause between the other steps (typing the name, Tab, typing the password).");
+    Tip(ID_S_PRIV_TABS, L"Tab presses between the username and the password.");
+    Tip(ID_S_PRIV_CLEAR, L"Backspaces pressed before typing each box, to remove old text (for example a remembered username). 0 = none.");
+    Tip(ID_S_PRIV_ENTERAFTER, L"Press Enter after the password to log in.");
+    Tip(ID_S_POP_COUNT, L"Official game: how many times the key below is pressed before the username is typed (that clears any pop-ups before Arc's login page).");
+    Tip(ID_S_POP_KEY_ENTER, L"Clear the pop-up with the Enter key.");
+    Tip(ID_S_POP_KEY_ESC, L"Clear the pop-up with the Escape key.");
+    Tip(ID_S_POP_PAUSE, L"Pause after those key presses, so the login page can appear (only used when the count is above 0).");
+    Tip(ID_S_POP_CLEAR, L"Backspaces pressed before typing each box, to remove old text. 0 = none.");
+    Tip(ID_S_POP_ENTERAFTER, L"Press Enter after the password to log in (on by default).");
     Tip(ID_S_ARC, L"Full path to Arc.exe. The file must be named Arc.exe. (If it is missing, the manager tries to find it by itself.)");
     Tip(ID_S_FOLDER, L"Open the folder that holds the settings, accounts and log files.");
-    Tip(ID_S_W, L"Width of the manager window's inside area, in pixels (900 or more).");
+    Tip(ID_S_W, L"Width of the manager window's inside area, in pixels (1040 or more).");
     Tip(ID_S_H, L"Height of the manager window's inside area, in pixels (420 or more).");
     Tip(ID_S_REMEMBER, L"Save the window size when the program closes, so it opens the same way next time.");
     Tip(ID_S_AUTOFILL, L"Type the username and password into Arc's login window for you.");
@@ -2100,8 +2682,9 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
             SettingsToUi(d);
             g_setDirty = true;
         }
-        else if ((id == ID_S_PAGE_BASIC || id == ID_S_PAGE_ADV) && note == BN_CLICKED) ShowSettingsPage(id == ID_S_PAGE_ADV ? 1 : 0);
+        else if ((id == ID_S_PAGE_BASIC || id == ID_S_PAGE_ADV || id == ID_S_PAGE_PRIV) && note == BN_CLICKED) ShowSettingsPage(id == ID_S_PAGE_PRIV ? 2 : (id == ID_S_PAGE_ADV ? 1 : 0));
         else if (id == ID_S_FOLDER && note == BN_CLICKED) ShellExecuteW(hwnd, L"open", g_configDir.c_str(), NULL, NULL, SW_SHOWNORMAL);
+        else if (id == ID_S_PRIV_PATHBROWSE && note == BN_CLICKED) BrowseInto(ID_S_PRIV_PATH, L"Programs (*.exe)\0*.exe\0All files\0*.*\0", L"Locate the game client or launcher");
         else if (id == ID_S_ARCBROWSE && note == BN_CLICKED) BrowseInto(ID_S_ARC, L"Arc.exe\0Arc.exe\0All files\0*.*\0", L"Locate Arc.exe");
         else if (id == ID_S_BGBROWSE && note == BN_CLICKED) BrowseInto(ID_S_BG, L"Pictures\0*.png;*.jpg;*.jpeg;*.bmp;*.gif\0All files\0*.*\0", L"Choose a background image");
         else if (!g_setLoading && (note == EN_CHANGE || note == BN_CLICKED)) {
@@ -2127,7 +2710,7 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
 static void OpenSettings() {
     if (g_setWnd) { SetForegroundWindow(g_setWnd); return; }
     DWORD style = WS_CAPTION | WS_SYSMENU, ex = WS_EX_CONTROLPARENT;
-    RECT rc = { 0, 0, 640, 512 };
+    RECT rc = { 0, 0, 640, 548 };
     AdjustWindowRectEx(&rc, style, FALSE, ex);
     int w = rc.right - rc.left, h = rc.bottom - rc.top;
     RECT mr, wa = { 0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN) };
@@ -2194,6 +2777,7 @@ static std::wstring BuildLogReport() {
     std::wstring r = L"ArcManager (C++) " + std::wstring(kAppVersion) + L" log report - " + std::wstring(ts) + L"\r\n";
     r += L"Windows " + std::to_wstring((long long)vi.dwMajorVersion) + L"." + std::to_wstring((long long)vi.dwMinorVersion) +
          L" build " + std::to_wstring((long long)vi.dwBuildNumber) + L"\r\n";
+    r += std::wstring(L"Mode: ") + (S.privateMode ? L"Private Servers" : L"Official Servers (Arc)") + L"\r\n";
     r += std::wstring(L"Arc.exe found: ") + (FileExists(S.arcPath) ? L"yes" : L"no") + L"\r\n";
     r += L"Settings: ";
     r += KV(L"AutoFill", S.autoFill) + KV(L"UsernameFocusTabs", S.usernameFocusTabs) + KV(L"FieldSeparatorTabs", S.fieldSeparatorTabs) +
@@ -2316,6 +2900,217 @@ static void OpenLogViewer() {
     SetTimer(wnd, 1, 1000, NULL);
 }
 
+// ---- deleting accounts: CLICK = ask first, SHIFT+CLICK = no question, CONTROL+CLICK = select, ALT+D = delete the selected ones
+static int SelectedCount() {
+    int n = 0;
+    for (size_t i = 0; i < g_rows.size(); i++) if (g_rows[i].selected) n++;
+    return n;
+}
+static void UpdateSelectionHint() {
+    if (!g_lblBlank) return;
+    int n = SelectedCount();
+    std::wstring t;
+    if (n > 0) t = std::to_wstring((long long)n) + L" selected - ALT+D to delete";   // (Esc clears the selection)
+    SetWindowTextW(g_lblBlank, t.c_str());
+    InvalidateRect(g_lblBlank, NULL, FALSE);
+}
+static void ClearSelection() {
+    for (size_t i = 0; i < g_rows.size(); i++) if (g_rows[i].selected) { g_rows[i].selected = false; InvalidateRect(g_rows[i].del, NULL, FALSE); }
+    UpdateSelectionHint();
+}
+static bool RowBusy(int i) { return g_rows[i].gamePid != 0 || g_rows[i].pending; }
+// a game client is running / a sign-in is in progress: those rows (and, while a sign-in runs, all rows) cannot be deleted
+static void UpdateDeleteButtons() {
+    for (size_t i = 0; i < g_rows.size(); i++) {
+        bool ok = g_active.row < 0 && !RowBusy((int)i);
+        if ((IsWindowEnabled(g_rows[i].del) != FALSE) != ok) {
+            EnableWindow(g_rows[i].del, ok);
+            if (!ok && g_rows[i].selected) g_rows[i].selected = false;
+            InvalidateRect(g_rows[i].del, NULL, FALSE);
+        }
+        bool upOk = g_active.row < 0 && i > 0, downOk = g_active.row < 0 && i + 1 < g_rows.size();   // moving rows is only blocked while a sign-in runs
+        if ((IsWindowEnabled(g_rows[i].up) != FALSE) != upOk) { EnableWindow(g_rows[i].up, upOk); InvalidateRect(g_rows[i].up, NULL, FALSE); }
+        if ((IsWindowEnabled(g_rows[i].down) != FALSE) != downOk) { EnableWindow(g_rows[i].down, downOk); InvalidateRect(g_rows[i].down, NULL, FALSE); }
+    }
+    UpdateSelectionHint();
+}
+// the control ids contain the row number: renumber them after rows were removed or moved
+static void RenumberRow(int k) {
+    Row& r = g_rows[k];
+    SetWindowLongPtrW(r.user, GWLP_ID, RowId(k, K_USER));
+    SetWindowLongPtrW(r.pass, GWLP_ID, RowId(k, K_PASS));
+    SetWindowLongPtrW(r.notes, GWLP_ID, RowId(k, K_NOTES));
+    SetWindowLongPtrW(r.sign, GWLP_ID, RowId(k, K_SIGN));
+    SetWindowLongPtrW(r.stop, GWLP_ID, RowId(k, K_STOP));
+    SetWindowLongPtrW(r.status, GWLP_ID, RowId(k, K_STATUS));
+    SetWindowLongPtrW(r.del, GWLP_ID, RowId(k, K_DEL));
+    SetWindowLongPtrW(r.up, GWLP_ID, RowId(k, K_UP));
+    SetWindowLongPtrW(r.down, GWLP_ID, RowId(k, K_DOWN));
+}
+static void RemoveRow(int i) {
+    Row& r = g_rows[i];
+    DelTip(g_tipMain, g_hwnd, r.del);
+    if (g_hotDel == r.del) g_hotDel = NULL;
+    DestroyWindow(r.user);
+    DestroyWindow(r.pass);
+    DestroyWindow(r.notes);
+    DestroyWindow(r.sign);
+    DestroyWindow(r.stop);
+    DestroyWindow(r.status);
+    DestroyWindow(r.del);
+    DelTip(g_tipMain, g_hwnd, r.up);
+    DelTip(g_tipMain, g_hwnd, r.down);
+    DestroyWindow(r.up);
+    DestroyWindow(r.down);
+    g_rows.erase(g_rows.begin() + i);
+    for (size_t k = (size_t)i; k < g_rows.size(); k++) RenumberRow((int)k);
+}
+static void AfterDelete() {
+    if (g_rows.empty()) { Account a; AddRow(a); }   // there is always at least one row
+    RelayoutRows();
+    SaveAccounts();   // saved right away (accounts.txt.bak keeps the version from before)
+    SaveSession();
+    UpdateDeleteButtons();
+}
+static std::wstring RowLabel(int i) {
+    std::wstring u = Trim(GetText(g_rows[i].user)), n = Trim(GetText(g_rows[i].notes));
+    if (u.empty()) u = L"(no username)";
+    return n.empty() ? u : u + L"  (" + n + L")";
+}
+// moves a row up (dir = -1) or down (dir = +1); the whole row (texts, running client, status) moves with it
+static void MoveRow(int i, int dir) {
+    int j = i + dir;
+    if (i < 0 || j < 0 || i >= (int)g_rows.size() || j >= (int)g_rows.size()) return;
+    if (g_active.row >= 0) { Msg(L"A sign-in is in progress. Wait for it to finish, or cancel it first.", L"Cannot move now"); return; }
+    std::swap(g_rows[i], g_rows[j]);
+    RenumberRow(i);
+    RenumberRow(j);
+    RelayoutRows();
+    for (size_t k = 0; k < g_rows.size(); k++) {   // keep the Tab order the same as the order on screen
+        HWND order[5] = { g_rows[k].user, g_rows[k].pass, g_rows[k].notes, g_rows[k].sign, g_rows[k].stop };
+        for (int n = 0; n < 5; n++) SetWindowPos(order[n], HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    }
+    SaveAccounts();   // the new order is saved right away
+    SaveSession();
+    UpdateDeleteButtons();
+}
+static void DeleteClick(int i) {
+    if (i < 0 || i >= (int)g_rows.size()) return;
+    bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0, ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+    if (g_active.row >= 0 || RowBusy(i)) { Msg(L"This account is busy (a sign-in is in progress or its game client is running).", L"Cannot delete now"); return; }
+    if (ctrl) {   // select / unselect
+        g_rows[i].selected = !g_rows[i].selected;
+        InvalidateRect(g_rows[i].del, NULL, FALSE);
+        UpdateSelectionHint();
+        return;
+    }
+    bool empty = GetText(g_rows[i].user).empty() && GetText(g_rows[i].pass).empty() && GetText(g_rows[i].notes).empty();
+    if (!shift && !empty) {
+        std::wstring q = L"Delete this account?\n\n" + RowLabel(i) + L"\n\nIt is removed from the list.";
+        if (MessageBoxW(g_hwnd, q.c_str(), L"Delete account", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES) return;
+    }
+    Log(L"account deleted (row " + std::to_wstring((long long)(i + 1)) + L")");
+    RemoveRow(i);
+    AfterDelete();
+}
+static void DeleteSelected() {
+    int n = SelectedCount();
+    if (n == 0) return;
+    if (g_active.row >= 0) { Msg(L"A sign-in is in progress. Wait for it to finish, or cancel it first.", L"Cannot delete now"); return; }
+    std::wstring list;
+    int shown = 0;
+    for (size_t i = 0; i < g_rows.size(); i++)
+        if (g_rows[i].selected && !RowBusy((int)i)) { if (shown < 8) list += L"\n" + RowLabel((int)i); shown++; }
+    if (shown == 0) { ClearSelection(); return; }
+    if (shown > 8) list += L"\n... and " + std::to_wstring((long long)(shown - 8)) + L" more";
+    std::wstring q = L"Delete the " + std::to_wstring((long long)shown) + (shown == 1 ? L" selected account?\n" : L" selected accounts?\n") + list + L"\n\nThey are removed from the list.";
+    if (MessageBoxW(g_hwnd, q.c_str(), L"Delete accounts", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES) return;
+    for (int i = (int)g_rows.size() - 1; i >= 0; i--)   // from the bottom up, so the numbers stay valid
+        if (g_rows[i].selected && !RowBusy(i)) { Log(L"account deleted (row " + std::to_wstring((long long)(i + 1)) + L")"); RemoveRow(i); }
+    ClearSelection();
+    AfterDelete();
+}
+
+// ---- switching between the official game (Arc) and private servers: each mode has its own account list
+static void UpdateModeUi() {
+    SetWindowTextW(g_hwnd, S.privateMode ? L"PWI Account Manager - Private Servers" : L"PWI Account Manager - Official Servers");
+    if (g_btnMode) InvalidateRect(g_btnMode, NULL, FALSE);
+}
+static void ClearRows() {
+    for (size_t i = 0; i < g_rows.size(); i++) {
+        DestroyWindow(g_rows[i].user);
+        DestroyWindow(g_rows[i].pass);
+        DestroyWindow(g_rows[i].notes);
+        DestroyWindow(g_rows[i].sign);
+        DestroyWindow(g_rows[i].stop);
+        DestroyWindow(g_rows[i].status);
+        DelTip(g_tipMain, g_hwnd, g_rows[i].del);
+        DelTip(g_tipMain, g_hwnd, g_rows[i].up);
+        DelTip(g_tipMain, g_hwnd, g_rows[i].down);
+        DestroyWindow(g_rows[i].del);
+        DestroyWindow(g_rows[i].up);
+        DestroyWindow(g_rows[i].down);
+    }
+    g_hotDel = NULL;
+    g_rows.clear();
+    UpdateSelectionHint();
+}
+static void SetPrivateMode(bool on) {
+    if (on == S.privateMode) return;
+    bool busy = g_active.row >= 0;
+    for (size_t i = 0; i < g_rows.size(); i++) if (g_rows[i].pending) busy = true;
+    if (busy) { Msg(L"A sign-in is still in progress. Finish or cancel it first, then switch.", L"Busy"); return; }
+    if (on && S.privShowWarning) {   // shown every time (it can be turned off on the Private Servers page); never at start-up
+        if (MessageBoxW(g_hwnd,
+                L"Private Servers mode\n\n"
+                L"In this mode the manager starts the program YOU choose (gear icon > Private Servers) with administrator rights "
+                L"and types your saved username and password into it. Arc is not used.\n\n"
+                L"Private servers are run by other people: use passwords here that you do not use anywhere else. "
+                L"This mode has its own account list.\n\n"
+                L"(You can turn this warning off on the Private Servers page of the settings.)\n\nSwitch to private servers mode?",
+                L"Private Servers", MB_OKCANCEL | MB_ICONWARNING) != IDOK) return;
+    }
+    SaveAccounts();   // the list of the mode we are leaving
+    SaveSession();
+    S.privateMode = on;
+    WritePrivateProfileStringW(L"Settings", L"PrivateMode", on ? L"1" : L"0", g_iniPath.c_str());
+    ApplyModePaths();
+    g_lastSession.clear();
+    LockWindowUpdate(g_hwnd);   // no drawing while the rows are replaced: it flickered on long lists
+    ClearRows();
+    std::vector<Account> accs = LoadAccounts();
+    for (size_t k = 0; k < accs.size(); k++) AddRow(accs[k]);
+    RelayoutRows();
+    AdoptSession();   // game clients of this mode that are still running
+    LockWindowUpdate(NULL);
+    RedrawWindow(g_hwnd, NULL, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW);   // everything is painted once
+    UpdateModeUi();
+    Log(std::wstring(L"mode switched to ") + (on ? L"Private Servers" : L"Official Servers"));
+}
+
+// game clients of the OTHER server mode (the list that is not shown) that are still running, counted from that mode's session file
+static int OtherModeRunning() {
+    std::string raw;
+    if (!ReadWholeFile(g_configDir + (S.privateMode ? L"\\session.txt" : L"\\session-private.txt"), raw)) return 0;
+    std::wstring text = FromUtf8(raw.data(), (int)raw.size());
+    std::vector<Proc> snap = Snapshot();
+    PidList pids = S.privateMode ? PidsByName(snap, L"elementclient.exe", L"elementclient_64.exe") : PidsByNameList(snap, S.privProcNames);
+    int n = 0;
+    size_t start = 0;
+    while (start < text.size()) {
+        size_t nl = text.find(L'\n', start);
+        std::wstring line = text.substr(start, (nl == std::wstring::npos) ? std::wstring::npos : nl - start);
+        start = (nl == std::wstring::npos) ? text.size() : nl + 1;
+        size_t t1 = line.find(L'\t');
+        size_t t2 = (t1 == std::wstring::npos) ? t1 : line.find(L'\t', t1 + 1);
+        if (t2 == std::wstring::npos) continue;
+        DWORD pid = (DWORD)_wcstoui64(line.substr(t1 + 1, t2 - t1 - 1).c_str(), NULL, 10);
+        unsigned long long saved = _wcstoui64(line.substr(t2 + 1).c_str(), NULL, 10), actual = 0;
+        if (pid && Has(pids, pid) && ProcessStartTime(pid, actual) && actual == saved) n++;
+    }
+    return n;
+}
+
 // ---- import / export of the accounts list (a text file in the same format as accounts.txt)
 static void ImportAccounts() {
     wchar_t file[MAX_PATH * 2] = L"";
@@ -2402,9 +3197,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
         g_btnAdd = MakeButton(hwnd, ID_ADD, L"+ Add account", 16, 0, 120, 28);
         g_btnShowPw = MakeButton(hwnd, ID_SHOWPW, L"Show passwords", 150, 0, 130, 22);
-        g_lblBlank = MakeLabel(hwnd, ID_BLANKHINT, L"Blank entries deleted on exit.", 296, 0, 220, 20);
-        g_lblStorage = MakeLabel(hwnd, ID_STORAGEHINT, L"Usernames and passwords are saved as PLAIN TEXT in %AppData%\\ArcManager\\accounts.txt", 520, 0, 520, 20);
+        g_lblBlank = MakeLabel(hwnd, ID_BLANKHINT, L"" /* L"Blank entries deleted on exit." (now in the minus button tooltip; this label shows how many rows are selected) */, 296, 0, 220, 20);
+        g_lblStorage = MakeLabel(hwnd, ID_STORAGEHINT, L"WARNING: Usernames & Passwords are saved as PLAIN TEXT", 520, 0, 520, 20);
+        g_lblVersion = MakeLabel(hwnd, ID_VERSION, kAppVersion, 900, 0, 110, 20);
         if (!S.showStorageHint) ShowWindow(g_lblStorage, SW_HIDE);
+        g_btnMode = MakeButton(hwnd, ID_MODE, L"", std::max(230, (int)((cr.right - 240) / 2)), 12, 240, 40);
         g_btnImport = MakeButton(hwnd, ID_IMPORT, L"Import...", 292, 0, 80, 28);
         g_btnExport = MakeButton(hwnd, ID_EXPORT, L"Export...", 378, 0, 80, 28);
         g_btnLog = MakeButton(hwnd, ID_LOG, L"", cr.right - 16 - 28 - 8 - 28, 0, 28, 28);
@@ -2412,6 +3209,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_btnGear = MakeButton(hwnd, ID_GEAR, L"", cr.right - 16 - 28, 0, 28, 28);
         g_gearOldProc = (WNDPROC)SetWindowLongPtrW(g_btnGear, GWLP_WNDPROC, (LONG_PTR)HoverProc);
         g_tipMain = MakeTooltips(hwnd);
+        for (size_t i = 0; i < g_rows.size(); i++) {
+            AddTip(g_tipMain, hwnd, g_rows[i].del, kDelTip);
+            AddTip(g_tipMain, hwnd, g_rows[i].up, L"Move this account up");
+            AddTip(g_tipMain, hwnd, g_rows[i].down, L"Move this account down");
+        }
+        AddTip(g_tipMain, hwnd, g_btnMode, L"OFFICIAL Servers = the game through Arc. PRIVATE Servers = private servers (no Arc). Each mode has its own account list. Click to switch.");
         AddTip(g_tipMain, hwnd, g_btnImport, L"Add accounts from a text file (same format as accounts.txt). Accounts already in the list are skipped.");
         AddTip(g_tipMain, hwnd, g_btnExport, L"Save the accounts list to a text file. The file contains the passwords as plain text.");
         AddTip(g_tipMain, hwnd, g_btnLog, L"View log");
@@ -2420,7 +3223,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         RelayoutRows();
         RenderBackground(true);
         AdoptSession();
+        UpdateModeUi();
         SetTimer(hwnd, ID_TIMER, 1000, NULL);
+        SetTimer(hwnd, ID_MARQUEE, 50, NULL);
         return 0;
     }
     case WM_SIZE:
@@ -2431,7 +3236,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_GETMINMAXINFO: {
         MINMAXINFO* mm = (MINMAXINFO*)lp;
-        RECT r = { 0, 0, 900, 420 };
+        RECT r = { 0, 0, 1040, 420 };
         AdjustWindowRectEx(&r, (DWORD)GetWindowLongW(hwnd, GWL_STYLE), FALSE, (DWORD)GetWindowLongW(hwnd, GWL_EXSTYLE));
         mm->ptMinTrackSize.x = r.right - r.left;
         mm->ptMinTrackSize.y = r.bottom - r.top;
@@ -2447,6 +3252,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return g_panel ? SendMessageW(g_panel, msg, wp, lp) : 0;
     case WM_TIMER:
         if (wp == ID_TIMER) UpdateState();
+        else if (wp == ID_PRIVTIMER) PrivateTick();
+        else if (wp == ID_MARQUEE) { if (g_hintScrolls && g_lblStorage && IsWindowVisible(g_lblStorage)) InvalidateRect(g_lblStorage, NULL, FALSE); }
         else if (wp == ID_BGTIMER) { KillTimer(hwnd, ID_BGTIMER); RenderBackground(false); }
         return 0;
     case WM_COMMAND: {
@@ -2457,6 +3264,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             RelayoutRows();
             EnsureRowVisible((int)g_rows.size() - 1);
             SetFocus(g_rows.back().user);
+        } else if (id == ID_MODE && note == BN_CLICKED) {
+            SetPrivateMode(!S.privateMode);
         } else if (id == ID_IMPORT && note == BN_CLICKED) {
             ImportAccounts();
         } else if (id == ID_EXPORT && note == BN_CLICKED) {
@@ -2477,6 +3286,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (row < (int)g_rows.size()) {
                 if (kind == K_SIGN) StartPlay(row);
                 else if (kind == K_STOP) StopClient(row);
+                else if (kind == K_DEL) DeleteClick(row);
+                else if (kind == K_UP) MoveRow(row, -1);
+                else if (kind == K_DOWN) MoveRow(row, 1);
             }
         }
         return 0;
@@ -2496,9 +3308,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         {
             int running = 0;
             for (size_t i = 0; i < g_rows.size(); i++) if (g_rows[i].gamePid) running++;
+            int other = OtherModeRunning();   // clients of the other list (Official / Private Servers) count too
+            running += other;
             if (running > 0) {
-                std::wstring q = std::to_wstring((long long)running) + (running == 1 ? L" game client is" : L" game clients are") +
-                                 L" still running.\n\nThey keep running if you close the manager, and the manager finds them again the next time it starts.\n\nClose the manager anyway?";
+                std::wstring q = std::to_wstring((long long)running) + (running == 1 ? L" game client is" : L" game clients are") + L" still running.";
+                if (other > 0) q += std::wstring(L"\n(") + std::to_wstring((long long)other) + L" in the " + (S.privateMode ? L"Official Servers" : L"Private Servers") + L" list)";
+                q += L"\n\nThey keep running if you close the manager, and the manager finds them again the next time it starts.\n\nClose the manager anyway?";
                 if (MessageBoxW(hwnd, q.c_str(), L"Game clients running", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES) return 0;
             }
         }
@@ -2540,11 +3355,12 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
     }
     InitPaths();
     LoadSettings();
+    ApplyModePaths();
 
     // close any Arc left running (e.g. a signed-in instance) before doing anything else
     StartNewLog();
-    AutoConfigArcPath();   // the configured Arc.exe is missing: look for it
-    if (S.killArcOnStart) {
+    if (!S.privateMode) AutoConfigArcPath();   // the configured Arc.exe is missing: look for it
+    if (S.killArcOnStart && !S.privateMode) {   // (private server mode never touches Arc)
         PidList arc = ArcPids(Snapshot());
         if (!arc.empty()) {
             Log(L"manager start: closing " + std::to_wstring((long long)arc.size()) + L" running Arc process(es)");
@@ -2632,6 +3448,10 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
         if (g_logWnd && (m.hwnd == g_logWnd || IsChild(g_logWnd, m.hwnd))) {
             if (m.message == WM_KEYDOWN && m.wParam == VK_ESCAPE) { PostMessageW(g_logWnd, WM_CLOSE, 0, 0); continue; }
             if (IsDialogMessageW(g_logWnd, &m)) continue;
+        }
+        if (!g_setWnd && !g_logWnd && (m.hwnd == hwnd || IsChild(hwnd, m.hwnd))) {
+            if (m.message == WM_SYSKEYDOWN && m.wParam == 'D') { DeleteSelected(); continue; }   // ALT+D
+            if (m.message == WM_KEYDOWN && m.wParam == VK_ESCAPE && SelectedCount() > 0) { ClearSelection(); continue; }
         }
         if (!IsDialogMessageW(hwnd, &m)) {
             TranslateMessage(&m);

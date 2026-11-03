@@ -26,11 +26,15 @@ Both run only one copy at a time (you cannot start the C++ and PowerShell versio
 - Closes Arc at the moment you choose (**when the launcher starts** or **when the game client starts**).
 - **CANCEL** (the SIGN IN button turns into CANCEL while working) closes Arc, the launcher and the patcher that this sign-in started.
 - **STOP** closes that account's game client.
-- Game client windows are **renamed to the note of their row**, so seven clients are easy to tell apart.
+- Game client windows are **renamed to the note of their row**, so multiple clients are easy to tell apart.
 - **Remembers running game clients**: close and reopen the manager and it recognises the clients it started (by process id and start time).
+- **Private server mode**: a switch on the main window turns the manager into an account manager for private servers (no Arc), with its own account list. See *Private servers* below.
+- **Re-ordering accounts** with the up and down arrows at the left of every row.
+- **Deleting accounts** with a minus button on every row: click (asks first), Shift+click (no question), or Control+click several rows and press Alt+D.
 - **Import / Export** of the accounts list as a text file.
-- A built-in **settings window** (gear icon) with *Basic* and *Advanced* pages, and a **log viewer** (paper icon) with *Copy log to clipboard*.
-- Optional background picture (a nice default is built into the program).
+- A built-in **settings window** (gear icon) with *Basic*, *Advanced* and *Private Servers* pages, and a **log viewer** (paper icon) with *Copy log to clipboard*.
+- Optional background picture (a nice default is built into both versions: into the .exe, and into the script as a text block at its end).
+- Closing the manager while game clients are running (in **either** list: Official or Private Servers) asks first.
 - Portable: no installer, nothing is written outside `%AppData%\ArcManager` (and the program's own folder if you choose).
 
 ---
@@ -44,7 +48,7 @@ Both run only one copy at a time (you cannot start the C++ and PowerShell versio
 4. Press **SIGN IN**.
 
 ### PowerShell version
-1. Keep `ArcManager.ps1`, `StartArcManager.bat` and `background.png` together in one folder.
+1. Keep `ArcManager.ps1` and `StartArcManager.bat` together in one folder (the default background picture is built into the script).
 2. Double-click `StartArcManager.bat` (it starts the script with the right options) and accept the administrator prompt.
 3. Continue as above.
 
@@ -57,16 +61,20 @@ The first time, the manager looks for `Arc.exe` by itself (a running Arc, the li
 
 | Control | What it does |
 |---|---|
+| **OFFICIAL Servers / PRIVATE Servers** switch | At the top of the window. OFFICIAL Servers = the game through Arc (the default). PRIVATE Servers = private servers, see below. Each mode has its own account list, and the window title shows the mode ("PWI Account Manager - Official Servers" / "- Private Servers"). The manager opens in the mode it was closed in. |
+| **Up / down arrows** (left and right of the minus button) | Move the account one place up or down; the whole row (texts, running game client, status) moves with it and the new order is saved right away. They are greyed out at the top or bottom of the list and while a sign-in is in progress. |
+| **Minus button** (middle of the three row buttons) | Deletes that account. It is grey and turns red when you point at it. **Click** = delete, after a confirmation that shows the username and note. **Shift+click** = delete without asking. **Control+click** = select the row (it turns red with a ring) so you can select several; then press **Alt+D** to delete them all (it asks once; **Esc** clears the selection). A counter next to the buttons shows how many rows are selected. A deleted account is gone from the list immediately and the list is saved right away (`accounts.txt.bak` keeps the version from before). The minus is greyed out for an account whose game client is running, and for all rows while a sign-in is in progress. There is always at least one row: deleting the last one just empties it. Rows left completely empty are also removed when you close the manager. |
 | Username / Password / Notes | One account per row. The note is also used as the game window title. |
 | **SIGN IN** | Signs in that account. While it works the button reads **CANCEL**. |
 | **STOP** | Force-closes that account's game client (asks first if you enabled *Ask before stopping*). |
 | Status text | Shows what is happening. Messages like *Stopped* or *Cancelled* return to *Idle* after a while. Running clients show their **PID**. |
-| **+ Add account** | Adds an empty row. Rows left completely empty are removed when you close the manager. |
+| **+ Add account** | Adds an empty row. |
 | **Import...** | Adds accounts from a text file in the same format as `accounts.txt` (`username`, `password`, `note`, separated by tabs). Accounts whose username is already in the list are skipped, never overwritten. |
 | **Export...** | Saves the accounts list to a text file (handy as a backup or for moving to another computer). **The file contains the passwords as plain text.** |
 | **Show passwords** | Shows or hides the passwords on screen. |
 | Paper icon | Opens the log viewer. |
-| Gear icon | Opens the settings window. |
+| Gear icon | Opens the settings window (it always opens on the *Basic* page). |
+| Closing the window | If game clients are running, in the shown list **or in the other one**, you are asked first. The clients keep running if you close the manager, and the next start recognises them again. |
 
 Usernames, passwords and notes cannot contain **tabs or line breaks** (they would corrupt the accounts file); such text is refused with a message.
 
@@ -78,15 +86,20 @@ Open the **gear icon**. Changes take effect **immediately** after *SAVE CONFIGUR
 *LOAD DEFAULTS* only fills in the standard values; nothing is saved until you press Save.
 *OPEN SETTINGS FOLDER* opens the folder with all of the program's files.
 
-Everything is stored in a plain text file, `ArcManager.ini`, which you can also edit by hand (save it and restart the
+Settings that were dropped in a newer version (`PrivateStartDir`, `PrivateNoticeShown`) are removed from the file automatically. Everything is stored in a plain text file, `ArcManager.ini`, which you can also edit by hand (save it and restart the
 manager). Comments in the file are kept when the program saves.
 
 | Key | Default | Window label | Meaning |
 |---|---|---|---|
 | `ArcPath` | `C:\Program Files (x86)\Arc\Arc.exe` | Arc Location | Full path to Arc. The file **must be named `Arc.exe`**. |
-| `WindowWidth`, `WindowHeight` | `1280`, `720` | Main window | Size of the window's inside area in pixels (minimum 900 x 420). |
+| `WindowWidth`, `WindowHeight` | `1280`, `720` | Main window | Size of the window's inside area in pixels (minimum 1040 x 420). |
 | `RememberWindowSize` | `1` | Remember the size when closing | Saves the size when you close the manager. |
 | `AutoFill` | `1` | Auto-fill username and password | Types the login for you. |
+| `PopupKey` | `enter` | Key for the pop-up | **Advanced page, "Login pop-up and typing".** The key (`enter` or `escape`) that clears any pop-ups before Arc's login page. |
+| `EntersBefore` | `0` | Enter/Escape presses for the pop-up | How many times that key is pressed before the username is typed (`0` = none). |
+| `PauseAfterPopupMs` | `1500` | Pause after the pop-up (ms) | Pause after those presses (only used when the count is above 0). |
+| `ClearBackspaces` | `0` | Backspaces to clear a box | Backspaces pressed before typing the username and the password, to remove old text (`0` = none). |
+| `EnterAfterPassword` | `1` | Press Enter after the password | Presses Enter after the password to log in. Turn it off if you want to press it yourself. |
 | `CloseArcAt` | `launcher` | Close Arc when | `launcher` = as soon as the launcher starts, `game` = when the game client starts. |
 | `ConfirmStop` | `0` | Ask before stopping a game client | Confirmation before STOP. |
 | `KillArcOnStart` | `1` | Close running Arc at start / sign-in | Closes a leftover Arc when the manager starts and before each sign-in. |
@@ -107,6 +120,20 @@ manager). Comments in the file are kept when the program saves.
 | `PendingTimeoutSeconds` | `600` | Game wait after close | How long to keep watching for the client after Arc was closed early. *(Advanced)* |
 | `RenameDurationSeconds` | `180` | Rename duration | The game opens and closes windows while loading, so its windows are re-checked every second for this long after the client starts. Raise it on a slow computer. *(Advanced)* |
 | `StatusResetSeconds` | `90` | Reset status after | Seconds until *Stopped / Cancelled / Timed out* return to *Idle* (`0` = never). *(Advanced)* |
+| `PrivateMode` | `0` | *(the switch on the main window)* | `1` = private server mode. |
+| `PrivateClientPath` | *(empty)* | Client or launcher location | **Private Servers page.** The program to start (the game client, or a launcher / patcher). |
+| `PrivateFlags` | `game:cpw nocheck startbypatcher console:1` | Command-line flags | Passed exactly as typed. The usual flags are filled in; change them for a server that needs different ones (copy the example above to get them back). |
+| `PrivateShowWarning` | `1` | Show a warning when switching to Private Servers | The warning is shown every time you switch to Private Servers (never at start-up). `0` = never show it. |
+| `PrivateProcessNames` | `elementclient.exe,elementclient_64.exe` | Process name(s) to wait for | The real game client, separated by commas. |
+| `PrivateWindowWaitSeconds` | `90` | Wait for the game window | Give up waiting for the client and its window after this long. |
+| `PrivateFirstKeyDelaySeconds` | `6` | Wait before the first key | Pause after the window appears. |
+| `PrivatePopupKey` | `enter` | Key for the pop-up | The key that clears the pop-up message some clients show before the login page: `enter` or `escape` (radio buttons on the Private Servers page). |
+| `PrivateEntersBefore` | `1` | Enter/Escape presses for the pop-up | How many times that key is pressed (`0` = none). |
+| `PrivatePauseAfterPopupMs` | `1500` | Pause after the pop-up | Milliseconds. |
+| `PrivatePauseStepMs` | `400` | Pause between steps | Milliseconds. |
+| `PrivateTabs` | `1` | Tabs between the two boxes | Tab presses between username and password. |
+| `PrivateClearBackspaces` | `0` | Backspaces to clear a box | Removes old text (for example a remembered username) before typing. `0` = none. |
+| `PrivateEnterAfterPassword` | `1` | Press Enter after the password | Logs in. |
 | `RunElevated` | `1` | *(not in the window)* | **PowerShell version only**: restart as administrator. The C++ version always asks for it. |
 
 ### Where the files are
@@ -117,13 +144,43 @@ Everything lives in `%AppData%\ArcManager` (type that into the Explorer address 
 |---|---|
 | `ArcManager.ini` | The settings. |
 | `accounts.txt` | Your accounts (**plain text**, see below). `accounts.txt.bak` is the previous version, kept automatically. |
-| `session.txt` | Which game clients are running (so they are recognised after a restart). |
+| `accounts-private.txt` | The accounts for private server mode (same format, own `.bak`). |
+| `session.txt`, `session-private.txt` | Which game clients are running in each mode (so they are recognised after a restart). |
 | `debug.log` / `debug.previous.log` | The log of this run and of the run before it. |
 
 **Portable mode:** if a file called `ArcManager.ini` sits next to the program, that copy is used instead.
 The program never creates it by itself.
 
 ---
+
+## Private Servers
+
+Many private servers do not use Arc: the game client logs in directly. Switch the manager to **PRIVATE Servers** (the switch at the
+top of the main window) and it works as an account manager for them. The manager opens in whichever mode it was closed in. The official mode is not affected in any way.
+
+**Set it up** (gear icon > **Private Servers**):
+
+1. **Client or launcher location**: the program to start. Usually the server's game client (`elementclient.exe`), but it can
+   also be a launcher or patcher. It is started with administrator rights, in its own folder.
+2. **Command-line flags**: passed exactly as typed. The usual ones (`game:cpw nocheck startbypatcher console:1`) are filled in; change them if your server needs different flags. Never put your password here.
+3. **Process name(s)**: the real game client. If you start a launcher, the manager waits until one of these processes appears.
+4. The **typing sequence**: Enter *or Escape* for the start-up pop-up (you choose the key, and how many presses; `0` if your client has none), a pause, the username, a
+   pause, Tab, a pause, the password, a pause, Enter. All counts and pauses can be changed (and *Backspaces to clear a box* removes old text such as a remembered username first, `0` = off), because every server and every
+   computer is different.
+
+**What SIGN IN does in private mode:** starts the program, waits for the game client and its window, waits a few seconds,
+then types the login as described above. The button reads **CANCEL** meanwhile (it closes the program it started).
+**STOP**, the PID display, remembering running clients, window renaming and the log work as in official mode. Arc is
+never touched in private mode, so an official game that is already running is safe.
+
+**Good to know**
+
+- Each mode has its **own account list** (`accounts-private.txt`). This keeps your official Arc password from ever being typed
+  into a private server by mistake. **Use different passwords for private servers**: they are run by other people.
+- A warning explains this every time you switch to Private Servers. Turn it off with *Show a warning when switching to Private Servers* on the Private Servers page.
+- If the keys do not reach the game, or the login is typed too early, raise the pauses and the wait before the first key.
+  The log (paper icon) records every step.
+- Servers that use a launcher with its own login form, or a web login, cannot be filled in this way.
 
 ## The log viewer
 
@@ -135,10 +192,11 @@ settings. It contains **no paths, usernames or passwords**, so it is safe to pas
 
 ## Security and privacy - please read
 
-- **Accounts are stored as PLAIN TEXT** in `%AppData%\ArcManager\accounts.txt`. Anyone who can read your Windows user
+- **Accounts are stored as PLAIN TEXT** in `%AppData%\ArcManager\accounts.txt` (and `accounts-private.txt`). Anyone who can read your Windows user
   profile can read your passwords. Do not use passwords you use elsewhere, and do not share the file or the folder.
-  (Turn on *Show plain-text storage notice* in the settings to be reminded at the bottom of the window.)
+  (Turn on *Show plain-text storage notice* in the settings to be reminded at the bottom of the window.) The version number is shown at the bottom right of the main window.
 - **No network access.** The program never connects to the internet. It does not send, upload or check for updates.
+- **Private servers** are run by third parties. Keep their passwords separate from your official ones (the two modes use separate account lists).
 - **Why administrator rights?** To type into Arc's windows and close its processes, the manager has to run with the
   same rights as Arc. For safety it only ever launches a program named **`Arc.exe`**, and only closes Arc, launcher,
   patcher and the game client of the accounts it manages.
@@ -153,7 +211,7 @@ settings. It contains **no paths, usernames or passwords**, so it is safe to pas
 
 1. Click the **paper icon**, then **COPY LOG TO CLIPBOARD**, and look at (or share) the text.
 2. *Arc not found*: set **Arc Location** with the gear icon (Browse...).
-3. *Typing goes to the wrong box or too early*: **Advanced** page - raise **Login delay**, or change the **Tabs** values.
+3. *Typing goes to the wrong box or too early*: **Advanced** page - raise **Login delay**, or change the **Tabs** values. If Arc shows a message before its login page, use *Login pop-up and typing* on the same page.
 4. *Game windows are not renamed*: check *Rename game windows to Notes*, that the row has a note, and raise
    **Rename duration** on a slow computer.
 5. *Accounts file damaged*: the previous version is `accounts.txt.bak` in the same folder.
@@ -177,8 +235,8 @@ Files: `main.cpp` (program), `ArcManager.rc` (icon, built-in background, version
 
 ### Changing the version information
 Edit the clearly marked block at the top of **`resource.h`** (file description, product name, version text, numeric
-version, copyright) and rebuild. The text is shown in *Properties > Details* of `ArcManager.exe`, in the log and in the
-settings window. For the PowerShell version change `$AppVersion` near the top of `ArcManager.ps1`.
+version, copyright) and rebuild. The text is shown in *Properties > Details* of `ArcManager.exe`, in the log and at the
+bottom right of the main window (the settings window shows the copyright). For the PowerShell version change `$AppVersion` near the top of `ArcManager.ps1`.
 
 ---
 
@@ -187,7 +245,7 @@ settings window. For the PowerShell version change `$AppVersion` near the top of
 ```
 ArcManager.exe  (built)        C++ version
   main.cpp  ArcManager.rc  resource.h  ArcManager.manifest  build.bat  Makefile  res\
-ArcManager.ps1  StartArcManager.bat  background.png        PowerShell version
+ArcManager.ps1  StartArcManager.bat                           PowerShell version (the default background is inside the script)
 README.md
 ```
 
