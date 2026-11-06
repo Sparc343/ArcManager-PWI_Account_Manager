@@ -24,6 +24,9 @@
 #include <cwctype>
 #include <string>
 #include <vector>
+#include <atomic>
+#include <chrono>
+#include <thread>
 
 #include "resource.h"
 
@@ -52,10 +55,10 @@ static const COLORREF cStopBg = RGB(70, 70, 80);
 enum {
     ID_TITLE = 800, ID_HDR1, ID_HDR2, ID_HDR3, ID_BLANKHINT, ID_STORAGEHINT, ID_VERSION,
     ID_ADD = 810, ID_SHOWPW = 811, ID_GEAR = 812, ID_LOG = 813, ID_IMPORT = 814, ID_EXPORT = 815, ID_MODE = 816,
-    ID_TIMER = 1, ID_BGTIMER = 2, ID_PRIVTIMER = 3, ID_MARQUEE = 4,
+    ID_TIMER = 1, ID_BGTIMER = 2, ID_PRIVTIMER = 3, ID_MARQUEE = 4, ID_TOOLHIDE = 5,
     ID_ROW_BASE = 1000
 };
-enum { K_USER = 0, K_PASS, K_NOTES, K_SIGN, K_STOP, K_STATUS, K_DEL, K_UP, K_DOWN };
+enum { K_USER = 0, K_PASS, K_NOTES, K_SIGN, K_STOP, K_STATUS, K_DEL, K_GRIP };   // K_GRIP = the drag handle (three lines) at the left of every row
 static inline int RowId(int row, int kind) { return ID_ROW_BASE + row * 10 + kind; }
 
 typedef std::vector<DWORD> PidList;
@@ -63,9 +66,9 @@ typedef std::vector<DWORD> PidList;
 // ------------------------------------------------------------------ settings
 struct Settings {
     std::wstring arcPath;
-    bool autoFill, closeAtLauncher, confirmStop, killArcOnStart, debugLog, showStorageHint, renameWindows;
+    bool autoFill, confirmStop, killArcOnStart, debugLog, showStorageHint, renameWindows;
     int usernameFocusTabs, fieldSeparatorTabs, loginDelayMs, minWaitSeconds, windowTimeoutSeconds;
-    int graceSeconds, launcherGraceSeconds, timeoutSeconds, pendingTimeoutSeconds;
+    int timeoutSeconds, pendingTimeoutSeconds;
     int windowWidth, windowHeight;
     bool rememberSize;
     int renameDurationSeconds, statusResetSeconds;
@@ -78,13 +81,27 @@ struct Settings {
     int privWindowWait, privFirstKey, privEnters, privPausePopup, privPauseStep, privTabs, privClear;
     std::wstring bgImage, bgMode;
     double bgDim;
+    // ---- hidden login (official game only): signs in without ever showing Arc on screen. On by default; the
+    // pop-up fields above remain as a fallback method and are only used when this is turned off.
+    bool useHiddenLogin;
+    int hlKeyDelayMs, hlCharDelayMs, hlPostTabDelayMs, hlPostFieldDelayMs, hlHideSettleDelayMs;
+    int hlSignInTimeoutSec, hlSignInPollIntervalMs;
+    int hlMainWindowInitialDelayMs, hlMainWindowTimeoutSec, hlMainWindowPollIntervalMs;
+    int hlPatcherWaitTimeoutSec, hlPatcherWaitPollIntervalMs;
+    // ---- clicking Start on the launcher / patcher once it appears (applies to both Launcher Modes)
+    bool clickPatcherStart;
+    int patcherStartPollIntervalMs, patcherStartTimeoutSec;
+    // ---- Show Arc Mode only: automatically click Arc's own Play button once autofill has submitted the
+    // credentials, instead of requiring the person to click it themselves (Hidden Arc Mode always does this - it
+    // has to, since Arc is never shown - so there is no separate setting for it there).
+    bool clickArcPlay;
 };
 static Settings S;
 
 static std::wstring g_iniPath, g_configDir, g_accountsPath, g_logPath, g_prevLogPath, g_sessionPath, g_exeDir;   // accounts + session paths belong to the current mode (see ApplyModePaths)
 static HINSTANCE g_hInst;
 static HWND g_hwnd;
-static HFONT g_font, g_fontBold, g_fontTitle;
+static HFONT g_font, g_fontBold, g_fontTitle, g_fontHiddenPopup;
 static HBRUSH g_brBg, g_brBox;
 static bool g_showPw = false;
 
@@ -243,10 +260,34 @@ static const char* kDefaultIni =
     "; Backspaces pressed before typing a box, to remove old text (0 = none), and whether Enter is pressed after the password (1 = yes)\r\n"
     "ClearBackspaces=0\r\n"
     "EnterAfterPassword=1\r\n"
-    "; CloseArcAt: launcher (as soon as Arc starts launcher.exe) or game (wait for elementclient.exe)\r\n"
-    "CloseArcAt=launcher\r\n"
-    "LauncherGraceSeconds=2\r\n"
-    "GraceSeconds=6\r\n"
+    "; ---- Hidden Login (official game only): signs in without Arc's window ever appearing on screen. Arc still runs and\r\n"
+    "; authenticates for real, it is only kept off screen. ON by default; when OFF, the pop-up fields above are used instead.\r\n"
+    "UseHiddenLogin=1\r\n"
+    "; milliseconds between simulated key presses / typed characters, and short settle pauses\r\n"
+    "HiddenKeyDelayMs=20\r\n"
+    "HiddenCharDelayMs=20\r\n"
+    "HiddenPostTabDelayMs=20\r\n"
+    "HiddenPostFieldDelayMs=20\r\n"
+    "HiddenHideSettleDelayMs=20\r\n"
+    "; how long to wait for Arc's Sign In window, and how often to check\r\n"
+    "HiddenSignInTimeoutSeconds=300\r\n"
+    "HiddenSignInPollIntervalMs=500\r\n"
+    "; after submitting the login, how long to wait before looking for Arc's real main window (too soon can click an unfinished placeholder),\r\n"
+    "; then how long to keep looking and how often\r\n"
+    "HiddenMainWindowInitialDelayMs=1600\r\n"
+    "HiddenMainWindowTimeoutSeconds=60\r\n"
+    "HiddenMainWindowPollIntervalMs=500\r\n"
+    "; after clicking Play, how long to wait for the game's launcher/patcher to start, and how often to check\r\n"
+    "HiddenPatcherWaitTimeoutSeconds=120\r\n"
+    "HiddenPatcherWaitPollIntervalMs=500\r\n"
+    "; automatically click Start on the launcher/patcher once it appears, so sign-in truly finishes the job.\r\n"
+    "; applies to both Launcher Modes (Hidden Arc Mode and Show Arc Mode)\r\n"
+    "ClickPatcherStart=1\r\n"
+    "PatcherStartPollIntervalMs=2000\r\n"
+    "PatcherStartTimeoutSeconds=180\r\n"
+    "; Show Arc Mode only: once auto-fill submits the username and password, automatically click Arc's own Play\r\n"
+    "; button too, instead of requiring you to click it yourself. Hidden Arc Mode always does this on its own.\r\n"
+    "ClickArcPlay=1\r\n"
     "TimeoutSeconds=300\r\n"
     "PendingTimeoutSeconds=600\r\n"
     "ConfirmStop=0\r\n"
@@ -259,7 +300,7 @@ static const char* kDefaultIni =
     "; Windows are re-checked every second for this many seconds after a game client starts (the game opens and closes windows while loading)\r\n"
     "RenameDurationSeconds=180\r\n"
     "; Messages such as Stopped / Cancelled / Timed out go back to Idle after this many seconds (0 = never)\r\n"
-    "StatusResetSeconds=90\r\n"
+    "StatusResetSeconds=30\r\n"
     "; Background image. Leave BackgroundImage blank to use background.png/jpg/jpeg/bmp/gif found next to the program or in %AppData%\\ArcManager;\r\n"
     "; if none is found, the built-in image is used.\r\n"
     "BackgroundImage=\r\n"
@@ -296,13 +337,20 @@ static const char* kDefaultIni =
 static Settings DefaultSettings() {
     Settings d;
     d.arcPath = L"C:\\Program Files (x86)\\Arc\\Arc.exe";
-    d.autoFill = true; d.closeAtLauncher = true; d.confirmStop = false; d.killArcOnStart = true; d.debugLog = true; d.showStorageHint = false; d.renameWindows = true; d.renameDurationSeconds = 180; d.statusResetSeconds = 90;
+    d.autoFill = true; d.confirmStop = false; d.killArcOnStart = true; d.debugLog = true; d.showStorageHint = false; d.renameWindows = true; d.renameDurationSeconds = 180; d.statusResetSeconds = 30;
     d.popEsc = false; d.enterAfterPw = true; d.popPresses = 0; d.popPause = 1500; d.clearBs = 0;
+    d.useHiddenLogin = true;
+    d.hlKeyDelayMs = 20; d.hlCharDelayMs = 20; d.hlPostTabDelayMs = 20; d.hlPostFieldDelayMs = 20; d.hlHideSettleDelayMs = 20;
+    d.hlSignInTimeoutSec = 300; d.hlSignInPollIntervalMs = 500;
+    d.hlMainWindowInitialDelayMs = 1600; d.hlMainWindowTimeoutSec = 60; d.hlMainWindowPollIntervalMs = 500;
+    d.hlPatcherWaitTimeoutSec = 120; d.hlPatcherWaitPollIntervalMs = 500;
+    d.clickPatcherStart = true; d.patcherStartPollIntervalMs = 2000; d.patcherStartTimeoutSec = 180;
+    d.clickArcPlay = true;
     d.privateMode = false; d.privShowWarning = true; d.privEnterAfter = true; d.privPopupEsc = false;
     d.privPath = L""; d.privFlags = L"game:cpw nocheck startbypatcher console:1"; d.privProcNames = L"elementclient.exe,elementclient_64.exe";
     d.privWindowWait = 90; d.privFirstKey = 6; d.privEnters = 1; d.privPausePopup = 1500; d.privPauseStep = 400; d.privTabs = 1; d.privClear = 0;
     d.usernameFocusTabs = 1; d.fieldSeparatorTabs = 1; d.loginDelayMs = 3000; d.minWaitSeconds = 6; d.windowTimeoutSeconds = 40;
-    d.graceSeconds = 6; d.launcherGraceSeconds = 2; d.timeoutSeconds = 300; d.pendingTimeoutSeconds = 600;
+    d.timeoutSeconds = 300; d.pendingTimeoutSeconds = 600;
     d.windowWidth = 1280; d.windowHeight = 720; d.rememberSize = true;
     d.bgImage = L""; d.bgMode = L"fill"; d.bgDim = 0.5;
     return d;
@@ -357,9 +405,6 @@ static void LoadSettings() {
     S.loginDelayMs = IniInt(L"LoginDelayMs", D.loginDelayMs);
     S.minWaitSeconds = IniInt(L"MinWaitSeconds", D.minWaitSeconds);
     S.windowTimeoutSeconds = IniInt(L"WindowTimeoutSeconds", D.windowTimeoutSeconds);
-    S.closeAtLauncher = _wcsicmp(IniStr(L"CloseArcAt", L"launcher").c_str(), L"game") != 0;
-    S.launcherGraceSeconds = IniInt(L"LauncherGraceSeconds", D.launcherGraceSeconds);
-    S.graceSeconds = IniInt(L"GraceSeconds", D.graceSeconds);
     S.timeoutSeconds = IniInt(L"TimeoutSeconds", D.timeoutSeconds);
     S.pendingTimeoutSeconds = IniInt(L"PendingTimeoutSeconds", D.pendingTimeoutSeconds);
     S.confirmStop = IniInt(L"ConfirmStop", D.confirmStop) != 0;
@@ -373,6 +418,23 @@ static void LoadSettings() {
     S.popPause = IniInt(L"PauseAfterPopupMs", D.popPause);
     S.clearBs = IniInt(L"ClearBackspaces", D.clearBs);
     S.enterAfterPw = IniInt(L"EnterAfterPassword", D.enterAfterPw) != 0;
+    S.useHiddenLogin = IniInt(L"UseHiddenLogin", D.useHiddenLogin) != 0;
+    S.hlKeyDelayMs = IniInt(L"HiddenKeyDelayMs", D.hlKeyDelayMs);
+    S.hlCharDelayMs = IniInt(L"HiddenCharDelayMs", D.hlCharDelayMs);
+    S.hlPostTabDelayMs = IniInt(L"HiddenPostTabDelayMs", D.hlPostTabDelayMs);
+    S.hlPostFieldDelayMs = IniInt(L"HiddenPostFieldDelayMs", D.hlPostFieldDelayMs);
+    S.hlHideSettleDelayMs = IniInt(L"HiddenHideSettleDelayMs", D.hlHideSettleDelayMs);
+    S.hlSignInTimeoutSec = IniInt(L"HiddenSignInTimeoutSeconds", D.hlSignInTimeoutSec);
+    S.hlSignInPollIntervalMs = IniInt(L"HiddenSignInPollIntervalMs", D.hlSignInPollIntervalMs);
+    S.hlMainWindowInitialDelayMs = IniInt(L"HiddenMainWindowInitialDelayMs", D.hlMainWindowInitialDelayMs);
+    S.hlMainWindowTimeoutSec = IniInt(L"HiddenMainWindowTimeoutSeconds", D.hlMainWindowTimeoutSec);
+    S.hlMainWindowPollIntervalMs = IniInt(L"HiddenMainWindowPollIntervalMs", D.hlMainWindowPollIntervalMs);
+    S.hlPatcherWaitTimeoutSec = IniInt(L"HiddenPatcherWaitTimeoutSeconds", D.hlPatcherWaitTimeoutSec);
+    S.hlPatcherWaitPollIntervalMs = IniInt(L"HiddenPatcherWaitPollIntervalMs", D.hlPatcherWaitPollIntervalMs);
+    S.clickPatcherStart = IniInt(L"ClickPatcherStart", D.clickPatcherStart) != 0;
+    S.clickArcPlay = IniInt(L"ClickArcPlay", D.clickArcPlay) != 0;
+    S.patcherStartPollIntervalMs = IniInt(L"PatcherStartPollIntervalMs", D.patcherStartPollIntervalMs);
+    S.patcherStartTimeoutSec = IniInt(L"PatcherStartTimeoutSeconds", D.patcherStartTimeoutSec);
     S.privateMode = IniInt(L"PrivateMode", D.privateMode) != 0;
     S.privShowWarning = IniInt(L"PrivateShowWarning", D.privShowWarning) != 0;
     S.privPath = Trim(IniStr(L"PrivateClientPath", L""));
@@ -405,6 +467,9 @@ static void LoadSettings() {
     // RemoveObsoleteKey(L"PrivateStartDir");   (these two are gone: remove the // in front of the next two lines only if they are needed again)
     RemoveObsoleteKey(L"PrivateStartDir");
     RemoveObsoleteKey(L"PrivateNoticeShown");
+    RemoveObsoleteKey(L"LauncherGraceSeconds");
+    RemoveObsoleteKey(L"GraceSeconds");
+    RemoveObsoleteKey(L"CloseArcAt");
 }
 
 // For safety the manager only ever launches a program named Arc.exe (it runs with administrator rights).
@@ -585,27 +650,54 @@ static void SetClipboardText(const std::wstring& s) {
 
 // ------------------------------------------------------------------ rows + launch state
 struct Row {
-    HWND user, pass, notes, sign, stop, status, del, up, down;
+    HWND user, pass, notes, sign, stop, status, del, grip;
     bool selected;   // marked with CONTROL+CLICK on its minus button (deleted with ALT+D)
     DWORD gamePid;
     unsigned long long gameStart; DWORD gameStartPid;     // start time of the game client (tells it apart from a reused PID)
     std::wstring title; DWORD titlePid; DWORD titleSeen;   // window renaming state
     bool pending; DWORD pendingSince; PidList pendingBase, pendingLaunchBase;
+    DWORD lastStartClickAt;   // throttles the auto-click-Start retries while pending (0 = not clicked yet)
+    bool hideTools;   // Hidden Arc Mode only: keep this row's launcher/patcher window off-screen while it is pending
+    bool startSawTool; DWORD startToolFirstSeenAt;   // debounce: only treat "process gone" as success after we actually saw it, and give it a moment after first appearing before the first click
     COLORREF statusColor;
     DWORD statusSince; bool statusTransient;   // transient messages (Stopped, Cancelled...) return to Idle after a while
     int titleLogs;
 };
 static std::vector<Row> g_rows;
 
-enum Phase { PH_NONE, PH_LOGIN, PH_WAITING, PH_CLOSING };
+// PH_HIDDEN: a hidden-login thread is running for this row (see WM_HIDDENLOGIN_DONE). PH_CLICKPLAY: Show Arc Mode
+// only - autofill just submitted the credentials, and we're waiting for Arc's library/Play page to load so we
+// can auto-click Play (see ClickArcPlay).
+enum Phase { PH_NONE, PH_LOGIN, PH_CLICKPLAY, PH_WAITING, PH_CLOSING, PH_HIDDEN };
+static const UINT WM_HIDDENLOGIN_DONE = WM_APP + 1;   // wParam = row index, lParam = (int)HiddenLoginResult
 struct Active {
     int row; Phase phase; DWORD start;
     PidList gameBase, arcBase, arcPids;
     HWND hwnd; DWORD hwndSince; DWORD seenAt; bool triggerLauncher;
     PidList launchBase;   // launcher.exe / patcher.exe that already existed when this sign-in began
     bool priv;            // a private-server sign-in (handled by PrivateTick, not by UpdateStateCore)
+    DWORD playClickStart; // PH_CLICKPLAY: when we started waiting for Arc's library/Play page (for the settle delay and as a fallback)
 };
-static Active g_active = { -1, PH_NONE, 0, PidList(), PidList(), PidList(), NULL, 0, 0, false, PidList(), false };
+static Active g_active = { -1, PH_NONE, 0, PidList(), PidList(), PidList(), NULL, 0, 0, false, PidList(), false, 0 };
+// true if any other row is still signing in or waiting for its own game client (its launcher / patcher must be left alone)
+// Auto-click Start: Hidden Arc Mode ALWAYS clicks Start (the launcher/patcher window is hidden, so the user could not
+// click it); in Show Arc Mode it follows the 'Auto-click Start (launcher/patcher)' setting.
+static bool AutoClickStartOn() { return S.useHiddenLogin || S.clickPatcherStart; }
+
+static bool OtherSignInsBusy(int row) {
+    if (g_active.row >= 0 && g_active.row != row) return true;
+    for (size_t i = 0; i < g_rows.size(); i++) if ((int)i != row && g_rows[i].pending) return true;
+    return false;
+}
+// the game client just started: force-close the launcher.exe / patcher.exe that this sign-in started (the patcher
+// can take a long time to close by itself). Skipped if another sign-in is under way, so its launcher is never hit.
+static void KillLaunchTools(const PidList& launchBase, int row) {
+    if (OtherSignInsBusy(row)) { Log(L"game client detected - another sign-in is under way, leaving launcher/patcher alone"); return; }
+    PidList tools = PidsByName(Snapshot(), L"launcher.exe", L"patcher.exe");
+    int closed = 0;
+    for (size_t k = 0; k < tools.size(); k++) if (!Has(launchBase, tools[k])) { KillPid(tools[k]); closed++; }
+    if (closed) Log(L"game client detected - force-closed " + std::to_wstring((long long)closed) + L" launcher/patcher process(es)");
+}
 
 static void SetStatus(int i, const std::wstring& text, COLORREF col, bool transient = false) {
     Row& r = g_rows[i];
@@ -700,6 +792,317 @@ static void SaveAccounts() {
     WriteWholeFileSafe(g_accountsPath, ToUtf8(BuildAccountsText(NULL)));
 }
 
+// ------------------------------------------------------------------ hidden login (official game only)
+// Signs in without Arc's window ever appearing on screen. Arc is still started for real and still does its own
+// real, official authentication - this only keeps its windows hidden / off-screen while that happens, then clicks
+// Arc's own Play button (also hidden) to start the real launcher/patcher. This is NOT a bypass of Arc: Arc runs
+// and authenticates exactly as it always does, the user just never has to look at it.
+//
+// Arc is forcefully killed (a) right before launching it here (a still-running Arc cannot be "called" again - it
+// has to be started fresh), and (b) unconditionally at the end of Run(), whatever the outcome, including on a
+// timeout or a cancel. That matches KillArcOnStart / the CANCEL logic used elsewhere in this program.
+//
+// Run() blocks for as long as it takes (it can be minutes) - it is always started on its own background thread
+// (see StartPlay) and reports back to the GUI thread by posting WM_HIDDENLOGIN_DONE, never by touching GUI
+// objects directly.
+enum class HiddenLoginResult { Success, ArcLaunchFailed, SignInWindowNotFound, MainWindowNotFound, PatcherNotDetected, Cancelled };
+struct HiddenLoginTiming {
+    int keyDelayMs, charDelayMs, postTabDelayMs, postFieldDelayMs, hideSettleDelayMs;
+    int signInTimeoutSec, signInPollIntervalMs;
+    int mainWindowInitialDelayMs, mainWindowTimeoutSec, mainWindowPollIntervalMs;
+    int patcherWaitTimeoutSec, patcherWaitPollIntervalMs;
+};
+static HiddenLoginTiming HiddenLoginTimingFromSettings(const Settings& v) {
+    HiddenLoginTiming t;
+    t.keyDelayMs = v.hlKeyDelayMs; t.charDelayMs = v.hlCharDelayMs; t.postTabDelayMs = v.hlPostTabDelayMs;
+    t.postFieldDelayMs = v.hlPostFieldDelayMs; t.hideSettleDelayMs = v.hlHideSettleDelayMs;
+    t.signInTimeoutSec = v.hlSignInTimeoutSec; t.signInPollIntervalMs = v.hlSignInPollIntervalMs;
+    t.mainWindowInitialDelayMs = v.hlMainWindowInitialDelayMs; t.mainWindowTimeoutSec = v.hlMainWindowTimeoutSec;
+    t.mainWindowPollIntervalMs = v.hlMainWindowPollIntervalMs;
+    t.patcherWaitTimeoutSec = v.hlPatcherWaitTimeoutSec; t.patcherWaitPollIntervalMs = v.hlPatcherWaitPollIntervalMs;
+    return t;
+}
+
+// the first top-level window with this exact title (Arc's "Sign In" dialog and its main "Arc" window both use exact titles)
+static HWND HL_FindWindowByTitle(const wchar_t* title) { return FindWindowExW(NULL, NULL, NULL, title); }
+
+struct HL_LargestCtx { int minW, minH; HWND best; int bestArea; };
+static BOOL CALLBACK HL_LargestEnum(HWND h, LPARAM lp) {
+    HL_LargestCtx* c = (HL_LargestCtx*)lp;
+    wchar_t buf[64] = L"";
+    GetWindowTextW(h, buf, 64);
+    if (wcscmp(buf, L"Arc") != 0) return TRUE;
+    RECT r; GetWindowRect(h, &r);
+    int w = r.right - r.left, ht = r.bottom - r.top;
+    if (w < c->minW || ht < c->minH) return TRUE;   // too small to be the real library window (an early placeholder shell, most likely)
+    int area = w * ht;
+    if (area > c->bestArea) { c->bestArea = area; c->best = h; }
+    return TRUE;
+}
+// Arc's real main/library window, found once sign-in has finished: titled exactly "Arc" and large enough to be the real thing
+static HWND HL_FindLargestArcWindow() {
+    HL_LargestCtx c; c.minW = 800; c.minH = 500; c.best = NULL; c.bestArea = 0;
+    EnumWindows(HL_LargestEnum, (LPARAM)&c);
+    return c.best;
+}
+static BOOL CALLBACK HL_HideEnum(HWND h, LPARAM lp) {
+    const PidList* pids = (const PidList*)lp;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(h, &pid);
+    if (!Has(*pids, pid)) return TRUE;
+    ShowWindow(h, SW_HIDE);
+    // belt-and-suspenders: Arc's Qt windows can keep showing already-rendered pixels for a moment after
+    // ShowWindow(SW_HIDE) reports success (a compositor quirk), so they are also moved off-screen.
+    SetWindowPos(h, NULL, -32000, -32000, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    return TRUE;
+}
+// hides every window belonging to a currently running Arc.exe process
+static void HL_HideAllArcWindows() {
+    PidList pids = ArcPids(Snapshot());
+    if (pids.empty()) return;
+    EnumWindows(HL_HideEnum, (LPARAM)&pids);
+}
+static bool HL_IsAnyProcessRunning(const wchar_t* n1, const wchar_t* n2) { return !PidsByName(Snapshot(), n1, n2).empty(); }
+static void HL_KillAllArc() {
+    PidList pids = ArcPids(Snapshot());
+    for (size_t i = 0; i < pids.size(); i++) KillPid(pids[i]);
+}
+// message-based input: these reach the target window (and are typed/clicked) even while it is hidden / off-screen,
+// unlike real SendInput input, which needs a visible, focusable, foreground window.
+static void HL_SendKeyPress(HWND h, WORD vk, int delayMs) {
+    PostMessageW(h, WM_KEYDOWN, vk, 0);
+    Sleep(delayMs);
+    PostMessageW(h, WM_KEYUP, vk, 0);
+    Sleep(delayMs);
+}
+static void HL_SendCharText(HWND h, const std::wstring& text, int delayMs) {
+    for (size_t i = 0; i < text.size(); i++) {
+        PostMessageW(h, WM_CHAR, text[i], 0);
+        Sleep(delayMs);
+    }
+}
+// End then a run of Backspace clears a box regardless of its old contents - a PostMessage'd Tab does not
+// select-on-focus the text the way a real Tab does, so the field is not already selected when typing starts.
+static void HL_ClearTextField(HWND h, int keyDelayMs) {
+    HL_SendKeyPress(h, VK_END, keyDelayMs);
+    for (int k = 0; k < 40; k++) HL_SendKeyPress(h, VK_BACK, keyDelayMs);
+}
+// the launcher/patcher window briefly exists at an undersized / not-yet-laid-out size right after it is created
+// (the same kind of early-placeholder issue Arc's own main window had); clicking Start too soon can hit the wrong
+// spot. Only click once its client area looks like the real, fully loaded window (the Start button was confirmed
+// at (853, 557) on a 984 x 744 client; these minimums give it some tolerance without being so loose they accept a placeholder).
+static bool HL_FindReadyPatcherWindow(const PidList& pids, HWND& outHwnd) {
+    HWND h = FindVisibleWindow(pids);
+    if (!h) return false;
+    RECT rc;
+    if (!GetClientRect(h, &rc)) return false;
+    if ((rc.right - rc.left) < 900 || (rc.bottom - rc.top) < 650) return false;
+    outHwnd = h;
+    return true;
+}
+static void HL_SendClickAt(HWND h, int x, int y) {
+    LPARAM pos = MAKELPARAM((WORD)x, (WORD)y);
+    PostMessageW(h, WM_MOUSEMOVE, 0, pos);
+    Sleep(15);
+    PostMessageW(h, WM_LBUTTONDOWN, MK_LBUTTON, pos);
+    Sleep(15);
+    PostMessageW(h, WM_LBUTTONUP, 0, pos);
+}
+
+class HiddenLoginOrchestrator {
+public:
+    // Blocks the calling thread until done (it can take minutes) - always call this from a worker thread, never
+    // the GUI thread. cancel, when not null, is polled between steps; when it becomes true the run is abandoned,
+    // Arc is killed, and Cancelled is returned.
+    HiddenLoginResult Run(const std::wstring& arcPath, const std::wstring& user, const std::wstring& pass,
+                          const HiddenLoginTiming& t, std::atomic<bool>* cancel) {
+        HL_KillAllArc();   // always start clean: Arc cannot be launched again while an instance of it is already running
+        Sleep(500);
+
+        StartHider();
+        Sleep(50);   // give the hider a moment to start before Arc's first window can appear
+        if (Cancelled(cancel)) { StopHider(); HL_KillAllArc(); return HiddenLoginResult::Cancelled; }
+
+        std::wstring cmd = L"\"" + arcPath + L"\"";
+        size_t cut = arcPath.find_last_of(L"\\/");
+        std::wstring dir = (cut == std::wstring::npos) ? L"." : arcPath.substr(0, cut);
+        STARTUPINFOW si; PROCESS_INFORMATION pi;
+        ZeroMemory(&si, sizeof(si)); ZeroMemory(&pi, sizeof(pi));
+        si.cb = sizeof(si);
+        std::vector<wchar_t> buf(cmd.begin(), cmd.end());
+        buf.push_back(0);
+        BOOL launched = CreateProcessW(NULL, &buf[0], NULL, NULL, FALSE, 0, NULL, dir.c_str(), &si, &pi);
+        if (!launched) { StopHider(); return HiddenLoginResult::ArcLaunchFailed; }
+        CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+        Log(L"hidden login: started Arc.exe (invisibly)");
+
+        HWND signInHwnd = NULL;
+        int waitedMs = 0, timeoutMs = t.signInTimeoutSec * 1000;
+        while (waitedMs < timeoutMs) {
+            signInHwnd = HL_FindWindowByTitle(L"Sign In");
+            if (signInHwnd || Cancelled(cancel)) break;
+            Sleep(t.signInPollIntervalMs);
+            waitedMs += t.signInPollIntervalMs;
+        }
+        if (Cancelled(cancel)) { StopHider(); HL_KillAllArc(); return HiddenLoginResult::Cancelled; }
+        if (!signInHwnd) {
+            StopHider(); HL_KillAllArc();
+            Log(L"hidden login: the Sign In window never appeared");
+            return HiddenLoginResult::SignInWindowNotFound;
+        }
+
+        PauseHider();
+        ShowWindow(signInHwnd, SW_HIDE);
+        Sleep(t.hideSettleDelayMs);
+
+        HL_SendKeyPress(signInHwnd, VK_TAB, t.keyDelayMs);
+        Sleep(t.postTabDelayMs);
+        HL_ClearTextField(signInHwnd, t.keyDelayMs);
+        HL_SendCharText(signInHwnd, user, t.charDelayMs);
+        Sleep(t.postFieldDelayMs);
+
+        HL_SendKeyPress(signInHwnd, VK_TAB, t.keyDelayMs);
+        Sleep(t.postTabDelayMs);
+        HL_ClearTextField(signInHwnd, t.keyDelayMs);
+        HL_SendCharText(signInHwnd, pass, t.charDelayMs);
+        Sleep(t.postFieldDelayMs);
+
+        HL_SendKeyPress(signInHwnd, VK_RETURN, t.keyDelayMs);
+        Log(L"hidden login: submitted username and password (hidden)");
+        ResumeHider();
+
+        if (Cancelled(cancel)) { StopHider(); HL_KillAllArc(); return HiddenLoginResult::Cancelled; }
+        Sleep(t.mainWindowInitialDelayMs);   // the real library window needs a moment to exist; without this, an early placeholder gets found (and clicked) instead
+
+        HWND mainHwnd = NULL;
+        waitedMs = 0; timeoutMs = t.mainWindowTimeoutSec * 1000;
+        while (waitedMs < timeoutMs) {
+            mainHwnd = HL_FindLargestArcWindow();
+            if (mainHwnd || Cancelled(cancel)) break;
+            Sleep(t.mainWindowPollIntervalMs);
+            waitedMs += t.mainWindowPollIntervalMs;
+        }
+        if (Cancelled(cancel)) { StopHider(); HL_KillAllArc(); return HiddenLoginResult::Cancelled; }
+        if (!mainHwnd) {
+            StopHider(); HL_KillAllArc();
+            Log(L"hidden login: signed in, but Arc's main window never appeared");
+            return HiddenLoginResult::MainWindowNotFound;
+        }
+
+        HL_SendClickAt(mainHwnd, 288, 405);   // Arc's Play button (confirmed coordinate); Arc is killed right after this anyway, so a brief flash here is acceptable
+        Log(L"hidden login: clicked Play");
+        Sleep(500);
+        StopHider();
+
+        bool patcherSeen = false;
+        waitedMs = 0; timeoutMs = t.patcherWaitTimeoutSec * 1000;
+        while (waitedMs < timeoutMs) {
+            if (HL_IsAnyProcessRunning(L"launcher.exe", L"patcher.exe")) { patcherSeen = true; break; }
+            if (Cancelled(cancel)) break;
+            Sleep(t.patcherWaitPollIntervalMs);
+            waitedMs += t.patcherWaitPollIntervalMs;
+        }
+        bool cancelledHere = !patcherSeen && Cancelled(cancel);
+        HL_KillAllArc();   // ALWAYS kill Arc at the end: patcher seen, not seen, or cancelled - it makes no difference
+        if (cancelledHere) return HiddenLoginResult::Cancelled;
+        Log(patcherSeen ? L"hidden login: launcher/patcher detected - done" : L"hidden login: the launcher/patcher never appeared");
+        // returns right away so the "Obtaining ARC / PWI TOKEN Now" popup closes the instant the launcher/patcher
+        // is detected; auto-clicking Start (if on) is handled afterwards by the same tick-based logic Show Arc
+        // Mode uses (see UpdateStateCore), with its own "Starting Game" popup - the same behavior either way
+        return patcherSeen ? HiddenLoginResult::Success : HiddenLoginResult::PatcherNotDetected;
+    }
+
+private:
+    std::atomic<bool> hiderRunning{false};
+    std::atomic<bool> hiderPaused{false};
+    std::thread hiderThread;
+
+    static bool Cancelled(std::atomic<bool>* c) { return c && c->load(); }
+
+    void StartHider() {
+        hiderRunning = true;
+        hiderPaused = false;
+        hiderThread = std::thread([this]() {
+            while (hiderRunning.load()) {
+                if (!hiderPaused.load()) HL_HideAllArcWindows();
+                // any faster than this contends with the PostMessage'd typing below for the message queue, which
+                // can let a single frame slip through visibly before the hide takes hold
+                std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+            }
+        });
+    }
+    void PauseHider()  { hiderPaused = true; }
+    void ResumeHider() { hiderPaused = false; }
+    void StopHider() {
+        hiderRunning = false;
+        if (hiderThread.joinable()) hiderThread.join();
+    }
+};
+
+// state for the one hidden-login thread that can be running at a time (guarded the same way as g_active.row)
+static std::thread g_hiddenThread;
+static std::atomic<bool> g_hiddenCancel(false);
+static HWND g_hiddenPopup = NULL;
+static HWND g_startingPopup = NULL;
+
+// shared by both small always-on-top status popups; which one draws which text is set with SetWindowLongPtrW(GWLP_USERDATA)
+static LRESULT CALLBACK StatusPopupProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(h, &ps);
+        RECT rc; GetClientRect(h, &rc);
+        SetBkMode(dc, OPAQUE);
+        SetBkColor(dc, cBg);
+        SetTextColor(dc, cWhite);
+        HGDIOBJ old = SelectObject(dc, g_fontHiddenPopup);
+        ExtTextOutW(dc, 0, 0, ETO_OPAQUE, &rc, L"", 0, NULL);
+        const wchar_t* text = (const wchar_t*)GetWindowLongPtrW(h, GWLP_USERDATA);
+        if (text) DrawTextW(dc, text, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        SelectObject(dc, old);
+        EndPaint(h, &ps);
+        return 0;
+    }
+    case WM_CLOSE:
+        return 0;   // only CloseHiddenLoginPopup() / CloseStartingPopup() closes this window
+    }
+    return DefWindowProcW(h, msg, wp, lp);
+}
+static HWND CreateStatusPopup(const wchar_t* text) {
+    int w = 500, h = 300;
+    int x = (GetSystemMetrics(SM_CXSCREEN) - w) / 2, y = (GetSystemMetrics(SM_CYSCREEN) - h) / 2;
+    HWND hw = CreateWindowExW(WS_EX_TOPMOST, L"ArcManagerHiddenPopup", L"ArcManager",
+                               WS_POPUP | WS_BORDER | WS_CAPTION, x, y, w, h, g_hwnd, NULL, g_hInst, NULL);
+    if (hw) {
+        SetWindowLongPtrW(hw, GWLP_USERDATA, (LONG_PTR)text);
+        ShowWindow(hw, SW_SHOWNOACTIVATE);
+    }
+    return hw;
+}
+// a small always-on-top status window shown for the whole duration of a hidden sign-in, so the user does not
+// think the program has frozen while Arc is doing its (invisible) work. Non-blocking: created on the GUI thread
+// and left to the normal message loop; closed the instant the launcher/patcher is detected (WM_HIDDENLOGIN_DONE).
+static void ShowHiddenLoginPopup() {
+    if (g_hiddenPopup) return;
+    g_hiddenPopup = CreateStatusPopup(L"Obtaining ARC / PWI TOKEN Now");
+}
+static void CloseHiddenLoginPopup() {
+    if (!g_hiddenPopup) return;
+    DestroyWindow(g_hiddenPopup);
+    g_hiddenPopup = NULL;
+}
+// shown while the manager is auto-clicking Start on the launcher/patcher (either Launcher Mode); closed the
+// instant the real game client (elementclient.exe / elementclient_64.exe) is detected.
+static void ShowStartingPopup() {
+    if (g_startingPopup) return;
+    g_startingPopup = CreateStatusPopup(L"Starting Game");
+}
+static void CloseStartingPopup() {
+    if (!g_startingPopup) return;
+    DestroyWindow(g_startingPopup);
+    g_startingPopup = NULL;
+}
+
 // ------------------------------------------------------------------ the launch flow
 static bool LaunchArc() {
     std::wstring cmd = L"\"" + S.arcPath + L"\"";
@@ -728,7 +1131,11 @@ static void ClearBoxKeys(int n) {
     TapKey(VK_END);
     for (int k = 0; k < n; k++) TapKey(VK_BACK);
 }
-static void InvokeAutoFill() {
+// returns true only if the username and password were both typed AND the login was actually submitted (Enter
+// pressed after the password) - i.e. only when it's safe to go looking for Arc's Play button on our own
+// (see ClickArcPlay / PH_CLICKPLAY). Every other outcome (no saved password, lost focus, Enter not sent) means
+// the person still has to finish signing in themselves, so auto-clicking Play would be premature.
+static bool InvokeAutoFill() {
     int i = g_active.row;
     std::wstring user = Trim(GetText(g_rows[i].user));
     std::wstring pass = GetText(g_rows[i].pass);
@@ -736,7 +1143,7 @@ static void InvokeAutoFill() {
     BringToFront(g_active.hwnd);
     Sleep(400);
     if (!ArcFocused(g_active.arcPids)) { BringToFront(g_active.hwnd); Sleep(500); }
-    if (!ArcFocused(g_active.arcPids)) { Log(L"Arc not focused - fallback"); Fallback(i, L"Could not focus Arc"); return; }
+    if (!ArcFocused(g_active.arcPids)) { Log(L"Arc not focused - fallback"); Fallback(i, L"Could not focus Arc"); return false; }
 
     wchar_t cls[128] = L"", title[128] = L"";
     GetClassNameW(g_active.hwnd, cls, 128);
@@ -757,15 +1164,17 @@ static void InvokeAutoFill() {
     for (int k = 0; k < S.fieldSeparatorTabs; k++) TapKey(VK_TAB);
     Sleep(200);
 
-    if (pass.empty()) { SetStatus(i, L"Username typed - no password saved, enter it in Arc", cAmber); return; }
-    if (!ArcFocused(g_active.arcPids)) { SetStatus(i, L"Focus left Arc - password was NOT typed", cAmber); Log(L"focus left Arc before password"); return; }
+    if (pass.empty()) { SetStatus(i, L"Username typed - no password saved, enter it in Arc", cAmber); return false; }
+    if (!ArcFocused(g_active.arcPids)) { SetStatus(i, L"Focus left Arc - password was NOT typed", cAmber); Log(L"focus left Arc before password"); return false; }
     Log(L"typing password (" + std::to_wstring((long long)pass.size()) + L" chars)");
     CtrlA();
     ClearBoxKeys(S.clearBs);
     TypeText(pass);
     Sleep(200);
-    if (S.enterAfterPw) TapKey(VK_RETURN);
-    SetStatus(i, L"Signed in as '" + user + L"' - click Play in Arc", cWhite);
+    if (!S.enterAfterPw) { SetStatus(i, L"Signed in as '" + user + L"' - press Enter / click Sign In, then click Play in Arc", cWhite); return false; }
+    TapKey(VK_RETURN);
+    SetStatus(i, L"Signed in as '" + user + L"'" + (S.clickArcPlay ? L" - clicking Play..." : L" - click Play in Arc"), cWhite);
+    return true;
 }
 
 // ---- characters that would break accounts.txt (tab, line breaks and other control characters) are refused
@@ -1070,6 +1479,13 @@ static void StartPlay(int i) {
     }
     if (g_active.row >= 0) {
         if (g_active.row == i) {
+            if (g_active.phase == PH_HIDDEN) {
+                // the hidden-login thread is still running: ask it to stop rather than touching Arc from here.
+                // It checks this flag between steps, kills Arc itself, and reports back (Cancelled) via WM_HIDDENLOGIN_DONE.
+                g_hiddenCancel = true;
+                SetStatus(i, L"Cancelling - this can take a few seconds", cWhite);
+                return;
+            }
             CloseLaunchLeftovers(g_active.launchBase);
             if (g_rows[i].gamePid) FinishActive(L"Running (PID " + std::to_wstring((long long)g_rows[i].gamePid) + L")", cGreen);   // the game client was already up
             else FinishActive(L"Cancelled - Arc, launcher and patcher closed", cGray, true);
@@ -1090,6 +1506,39 @@ static void StartPlay(int i) {
     }
     if (!FileExists(S.arcPath)) {
         Msg((L"Arc.exe not found at:\n" + S.arcPath + L"\n\nSet the Arc Location with the gear button (bottom right).").c_str(), L"Arc not found");
+        return;
+    }
+
+    if (S.useHiddenLogin) {
+        std::wstring pass = GetText(r.pass);
+        SaveAccounts();
+        Log(L"---- SIGN IN (hidden), row " + std::to_wstring((long long)(i + 1)) + L" ----");
+
+        std::vector<Proc> snap = Snapshot();
+        g_active.row = i;
+        g_active.phase = PH_HIDDEN;
+        g_active.start = GetTickCount();
+        g_active.gameBase = GamePids(snap);
+        g_active.launchBase = PidsByName(snap, L"launcher.exe", L"patcher.exe");
+        g_active.arcBase = ArcPids(snap);
+        g_active.arcPids.clear();
+        g_active.hwnd = NULL;
+        g_active.hwndSince = g_active.start;
+        g_active.seenAt = 0;
+        g_active.triggerLauncher = false;
+
+        g_hiddenCancel = false;
+        HiddenLoginTiming t = HiddenLoginTimingFromSettings(S);
+        std::wstring arcPath = S.arcPath;
+        g_hiddenThread = std::thread([i, arcPath, name, pass, t]() {
+            HiddenLoginOrchestrator orch;
+            HiddenLoginResult res = orch.Run(arcPath, name, pass, t, &g_hiddenCancel);
+            PostMessageW(g_hwnd, WM_HIDDENLOGIN_DONE, (WPARAM)i, (LPARAM)(int)res);
+        });
+
+        SetSignText(i, L"CANCEL");
+        SetStatus(i, L"Signing in hidden - this can take a minute (CANCEL to stop)", cWhite);
+        ShowHiddenLoginPopup();
         return;
     }
 
@@ -1324,6 +1773,32 @@ static void UpdateStateCore() {
             Log(L"pending launch timed out");
         }
     }
+
+    // Arc is already closed and we're waiting for the game client (true for both Launcher Modes - Hidden Arc
+    // Mode's own thread returns the instant the launcher/patcher is detected, so from here on it is just a
+    // pending row like Show Arc Mode's), so automatically click Start on the launcher/patcher until it closes
+    // or we time out. The "Starting Game" popup (separate from the "Obtaining ARC / PWI TOKEN Now" popup, which
+    // already closed) covers this whole phase, in both modes alike.
+    if (AutoClickStartOn()) {
+        for (size_t i = 0; i < g_rows.size(); i++) {
+            Row& r = g_rows[i];
+            if (!r.pending) continue;
+            if ((now - r.pendingSince) > (DWORD)S.patcherStartTimeoutSec * 1000) continue;
+            if (r.lastStartClickAt != 0 && (now - r.lastStartClickAt) < (DWORD)S.patcherStartPollIntervalMs) continue;
+            r.lastStartClickAt = now;
+            PidList toolPids = Minus(PidsByName(snap, L"launcher.exe", L"patcher.exe"), r.pendingLaunchBase);
+            if (toolPids.empty()) {
+                // only trust this as "Start worked and it closed" once we actually saw it running; an empty read
+                // before that just means it has not finished launching yet (the launcher.exe process it starts as
+                // can briefly hand off to patcher.exe, with neither name matching for an instant)
+                continue;
+            }
+            if (!r.startSawTool) { r.startSawTool = true; r.startToolFirstSeenAt = now; continue; }   // give it a moment to reach its real size before the first click
+            if ((now - r.startToolFirstSeenAt) < 1500) continue;   // still settling
+            HWND toolHwnd;
+            if (HL_FindReadyPatcherWindow(toolPids, toolHwnd)) HL_SendClickAt(toolHwnd, 853, 557);   // the patcher's Start button (confirmed coordinate)
+        }
+    }
     PidList claimed = ClaimedPids();
     for (size_t g = 0; g < gameNow.size(); g++) {
         if (Has(claimed, gameNow[g])) continue;
@@ -1341,11 +1816,28 @@ static void UpdateStateCore() {
             SetStatus(best, L"Running (PID " + std::to_wstring((long long)r.gamePid) + L")", cGreen);
             EnableWindow(r.stop, TRUE);
             Log(L"assigned game client " + std::to_wstring((long long)r.gamePid) + L" to a pending row");
+            KillLaunchTools(r.pendingLaunchBase, best);
         }
     }
 
+    // "Starting Game" covers the whole click-Start phase above; close it the instant no row is in that phase any
+    // more - including the instant a row above just got matched to a real elementclient.exe / elementclient_64.exe
+    // (gameNow is built from GamePids(), which only matches those two process names), and on cancel or timeout too.
+    bool stillStarting = false;
+    if (AutoClickStartOn()) {
+        for (size_t i = 0; i < g_rows.size(); i++) {
+            if (g_rows[i].pending && (now - g_rows[i].pendingSince) <= (DWORD)S.patcherStartTimeoutSec * 1000) {
+                stillStarting = true;
+                break;
+            }
+        }
+    }
+    if (stillStarting) ShowStartingPopup();
+    else CloseStartingPopup();
+
     if (g_active.row < 0) return;
     if (g_active.priv) return;   // a private-server sign-in is handled by PrivateTick
+    if (g_active.phase == PH_HIDDEN) return;   // a hidden-login thread is handling this row; see WM_HIDDENLOGIN_DONE
     Active& a = g_active;
     Row& r = g_rows[a.row];
     double elapsed = (now - a.start) / 1000.0;
@@ -1353,8 +1845,7 @@ static void UpdateStateCore() {
 
     // what tells us the launch has started: launcher.exe spawned by THIS Arc, or a new game client
     PidList newGame = Minus(Minus(gameNow, a.gameBase), ClaimedPids());
-    PidList launch;
-    if (S.closeAtLauncher) launch = LauncherPidsOf(snap, a.arcPids);
+    PidList launch = LauncherPidsOf(snap, a.arcPids);   // launcher.exe / patcher.exe started by THIS Arc
     if (a.phase != PH_CLOSING && (!newGame.empty() || !launch.empty())) {
         a.phase = PH_CLOSING;
         a.seenAt = now;
@@ -1371,28 +1862,35 @@ static void UpdateStateCore() {
             else if ((now - a.hwndSince) >= (DWORD)S.loginDelayMs && elapsed >= S.minWaitSeconds) {
                 a.phase = PH_WAITING;
                 Log(L"window stable, " + std::to_wstring((long long)(int)elapsed) + L"s since start -> typing");
-                InvokeAutoFill();
+                bool submitted = InvokeAutoFill();
+                if (submitted && S.clickArcPlay) { a.phase = PH_CLICKPLAY; a.playClickStart = now; }
             }
         } else if (elapsed > S.windowTimeoutSeconds) {
             a.phase = PH_WAITING;
             Log(L"timed out finding a visible Arc window");
             Fallback(a.row, L"Couldn't find Arc's login window");
         }
+    } else if (a.phase == PH_CLICKPLAY) {
+        // Show Arc Mode: credentials were submitted; wait for Arc to swap from the login page to its real
+        // library/Play page (clicking too soon can hit an unfinished placeholder instead) and click Play there -
+        // the same confirmed coordinate Hidden Arc Mode uses, found the same way (HL_FindLargestArcWindow)
+        if (elapsed > S.timeoutSeconds) { FinishActive(L"Timed out waiting for a game client", cAmber, true); return; }
+        if ((now - a.playClickStart) < 1500) return;   // give Arc a moment to swap pages before the first attempt
+        HWND mainHwnd = HL_FindLargestArcWindow();
+        if (mainHwnd) {
+            HL_SendClickAt(mainHwnd, 288, 405);   // Arc's Play button (confirmed coordinate)
+            Log(L"clicked Play automatically (show arc mode)");
+            a.phase = PH_WAITING;
+        }
     } else if (a.phase == PH_WAITING) {
         if (elapsed > S.timeoutSeconds) FinishActive(L"Timed out waiting for a game client", cAmber, true);
     } else if (a.phase == PH_CLOSING) {
-        int grace = a.triggerLauncher ? S.launcherGraceSeconds : S.graceSeconds;
-        double left = grace - (now - a.seenAt) / 1000.0;
-        if (left > 0) {
-            std::wstring secs = std::to_wstring((long long)(int)(left + 0.999));
-            if (a.triggerLauncher) SetStatus(a.row, L"Launcher started - closing Arc in " + secs + L"s", cGreen);
-            else SetStatus(a.row, L"Game running (PID " + std::to_wstring((long long)r.gamePid) + L") - closing Arc in " + secs + L"s", cGreen);
-            return;
-        }
+        // no delay: Arc is closed the instant the launcher/patcher (or game client) is detected
         // close only the Arc process(es) that were started for this launch
         PidList mine = Minus(ArcPids(Snapshot()), a.arcBase);
         for (size_t k = 0; k < mine.size(); k++) KillPid(mine[k]);
         if (r.gamePid) {
+            KillLaunchTools(a.launchBase, a.row);
             FinishActive(L"Running (PID " + std::to_wstring((long long)r.gamePid) + L")", cGreen);
         } else {
             // Arc is closed; the row picks up its game client when it appears
@@ -1400,11 +1898,41 @@ static void UpdateStateCore() {
             r.pendingSince = now;
             r.pendingBase = a.gameBase;
             r.pendingLaunchBase = a.launchBase;
+            r.lastStartClickAt = 0;
+            r.hideTools = false;   // Show Arc Mode: the launcher/patcher stays visible
+            r.startSawTool = false; r.startToolFirstSeenAt = 0;
             int waitRow = a.row;
             FinishActive(L"Arc closed - waiting for game client (CANCEL to stop)", cWhite);
             SetSignText(waitRow, L"CANCEL");
         }
     }
+}
+
+// Hidden Arc Mode: the game's launcher / patcher window is kept off-screen too, the same way Arc's is (moved, not
+// hidden or minimized, so it still counts as visible and keeps its real size for the Start click). Runs 10 times a
+// second, only while a Hidden Arc Mode row is waiting for its game client; Show Arc Mode rows are never touched.
+static BOOL CALLBACK HL_MoveOffEnum(HWND h, LPARAM lp) {
+    const PidList* pids = (const PidList*)lp;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(h, &pid);
+    if (!Has(*pids, pid)) return TRUE;
+    RECT r;
+    if (GetWindowRect(h, &r) && r.left <= -30000) return TRUE;   // already off-screen
+    SetWindowPos(h, NULL, -32000, -32000, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    return TRUE;
+}
+static void HideLaunchToolWindows() {
+    bool any = false;
+    PidList base;
+    for (size_t i = 0; i < g_rows.size(); i++) {
+        if (!g_rows[i].pending || !g_rows[i].hideTools) continue;
+        any = true;
+        for (size_t k = 0; k < g_rows[i].pendingLaunchBase.size(); k++) base.push_back(g_rows[i].pendingLaunchBase[k]);
+    }
+    if (!any) return;
+    PidList tools = Minus(PidsByName(Snapshot(), L"launcher.exe", L"patcher.exe"), base);
+    if (tools.empty()) return;
+    EnumWindows(HL_MoveOffEnum, (LPARAM)&tools);
 }
 
 static void UpdateDeleteButtons();
@@ -1432,7 +1960,7 @@ static int g_scroll = 0;
 static bool g_inLayout = false;
 
 static const int ROW_H = 40, ROW_TOP = 4, LIST_TOP = 80, BOTTOM_H = 52;
-static const int X_UP = 8, X_DEL = 34, X_DOWN = 60, X_USER = 92, X_PASS = 299, X_NOTES = 506, X_SIGN = 713, X_STOP = 843, X_STATUS = 927, FIELD_W = 195, SIGN_W = 122, STOP_W = 76;   // (the fields keep their old width; the buttons gave back a few pixels)
+static const int X_GRIP = 8, X_DEL = 34, X_USER = 66, X_PASS = 273, X_NOTES = 480, X_SIGN = 687, X_STOP = 817, X_STATUS = 901, FIELD_W = 195, SIGN_W = 122, STOP_W = 76;   // (the fields keep their old width; the buttons gave back a few pixels)
 
 // paints the part of the background that lies behind rect rc of a window.
 // (ox, oy) = where that window's client origin sits inside the main window's client area.
@@ -1660,9 +2188,112 @@ static const wchar_t* const kDelTip =
     L"CONTROL+CLICK to select several rows to delete,\n"
     L"      then ALT+D to delete them\n"
     L"Blank entries are also deleted on exit";
+static const wchar_t* const kGripTip =
+    L"DRAG up or down to move this account to a new place\n"
+    L"(ESC while dragging cancels)\n"
+    L"Or press ALT+UP / ALT+DOWN while the cursor is in\n"
+    L"      any box of this row to move it one place";
 static HWND g_hotDel = NULL;
+// ---- dragging a row by its grip (three lines)
+struct DragState { bool active; int row, target; HWND grip; };
+static DragState g_drag = { false, -1, -1, NULL };
+static void MoveRowTo(int from, int to);
+static void ScrollTo(int pos);
+static const int GRIP_TIMER = 7;
+static void DragLineRect(RECT* rc) {   // where the blue insertion line is drawn (in the panel); empty when the row would stay where it is
+    SetRectEmpty(rc);
+    if (!g_drag.active || g_drag.target == g_drag.row) return;
+    RECT pc;
+    GetClientRect(g_panel, &pc);
+    int edge = ROW_TOP + (g_drag.target + (g_drag.target > g_drag.row ? 1 : 0)) * ROW_H - g_scroll;   // top of the row after the line
+    int y = std::max(0, edge - 7);
+    SetRect(rc, 4, y, std::max(8, (int)pc.right - 4), y + 3);
+}
+static void InvalidateDragLine() {
+    RECT rc;
+    DragLineRect(&rc);
+    if (!IsRectEmpty(&rc)) InvalidateRect(g_panel, &rc, TRUE);
+}
+static void EndDrag() {
+    if (!g_drag.active) return;
+    InvalidateDragLine();
+    HWND g = g_drag.grip;
+    g_drag.active = false;
+    g_drag.row = g_drag.target = -1;
+    g_drag.grip = NULL;
+    KillTimer(g, GRIP_TIMER);
+    if (GetCapture() == g) ReleaseCapture();
+    InvalidateRect(g, NULL, FALSE);
+}
+static void UpdateDrag() {   // follows the mouse: finds the row under it, scrolls the list near its top / bottom edge
+    if (!g_drag.active) return;
+    POINT p;
+    GetCursorPos(&p);
+    ScreenToClient(g_panel, &p);
+    RECT pc;
+    GetClientRect(g_panel, &pc);
+    int step = 0;
+    if (p.y < 28) step = -(std::min(28 - (int)p.y, 56) / 4 + 4);
+    else if (p.y > pc.bottom - 28) step = std::min((int)p.y - ((int)pc.bottom - 28), 56) / 4 + 4;
+    bool scrolled = false;
+    if (step != 0) {
+        int before = g_scroll;
+        ScrollTo(g_scroll + step);
+        scrolled = (g_scroll != before);
+        GetCursorPos(&p);
+        ScreenToClient(g_panel, &p);
+    }
+    int n = (int)g_rows.size();
+    int t = (p.y + g_scroll - ROW_TOP) / ROW_H;
+    if (p.y + g_scroll - ROW_TOP < 0) t = 0;
+    t = std::max(0, std::min(t, n - 1));
+    if (t != g_drag.target) {
+        if (!scrolled) InvalidateDragLine();
+        g_drag.target = t;
+        if (!scrolled) InvalidateDragLine();
+    }
+    // while the list scrolls, the timer keeps the message queue busy and the rows were never painted (white boxes):
+    // paint the whole panel, the rows and the blue line right now
+    if (scrolled) RedrawWindow(g_panel, NULL, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW);
+}
 static LRESULT CALLBACK MinusProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     WNDPROC old = (WNDPROC)GetWindowLongPtrW(h, GWLP_USERDATA);
+    if (((GetDlgCtrlID(h) - ID_ROW_BASE) % 10) == K_GRIP) {   // the drag handle
+        switch (msg) {
+        case WM_LBUTTONDOWN:
+        case WM_LBUTTONDBLCLK:
+            if (!IsWindowEnabled(h)) return 0;
+            g_drag.active = true;
+            g_drag.row = g_drag.target = (GetDlgCtrlID(h) - ID_ROW_BASE) / 10;
+            g_drag.grip = h;
+            SetCapture(h);
+            SetTimer(h, GRIP_TIMER, 40, NULL);   // keeps the list scrolling while the mouse rests near its edge
+            InvalidateRect(h, NULL, FALSE);
+            return 0;
+        case WM_MOUSEMOVE:
+            if (g_drag.active && g_drag.grip == h) { UpdateDrag(); return 0; }
+            break;
+        case WM_TIMER:
+            if (wp == GRIP_TIMER) { UpdateDrag(); return 0; }
+            break;
+        case WM_LBUTTONUP:
+            if (g_drag.active && g_drag.grip == h) {
+                UpdateDrag();
+                int from = g_drag.row, to = g_drag.target;
+                EndDrag();
+                if (from != to) MoveRowTo(from, to);
+                return 0;
+            }
+            break;
+        case WM_CAPTURECHANGED:
+        case WM_CANCELMODE:
+            if (g_drag.active && g_drag.grip == h) EndDrag();   // e.g. Alt+Tab or a pop-up window appeared: cancel quietly
+            break;
+        case WM_SETCURSOR:
+            if (IsWindowEnabled(h)) { SetCursor(LoadCursorW(NULL, IDC_SIZEALL)); return TRUE; }
+            break;
+        }
+    }
     if (msg == WM_MOUSEMOVE && g_hotDel != h) {
         g_hotDel = h;
         TRACKMOUSEEVENT t;
@@ -1678,15 +2309,15 @@ static LRESULT CALLBACK MinusProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     }
     return CallWindowProcW(old, h, msg, wp, lp);
 }
-static void DrawMinusButton(const DRAWITEMSTRUCT* d) {   // also draws the up / down arrows
+static void DrawMinusButton(const DRAWITEMSTRUCT* d) {   // also draws the drag handle (three lines)
     int row = ((int)d->CtlID - ID_ROW_BASE) / 10;
     int kind = ((int)d->CtlID - ID_ROW_BASE) % 10;
-    bool arrow = (kind == K_UP || kind == K_DOWN);
-    bool selected = !arrow && row >= 0 && row < (int)g_rows.size() && g_rows[row].selected;
+    bool grip = (kind == K_GRIP);
+    bool selected = !grip && row >= 0 && row < (int)g_rows.size() && g_rows[row].selected;
     bool disabled = (d->itemState & ODS_DISABLED) != 0;
-    bool hot = (g_hotDel == d->hwndItem) && !disabled;
+    bool hot = ((g_hotDel == d->hwndItem) || (g_drag.active && g_drag.grip == d->hwndItem)) && !disabled;
     COLORREF fill = RGB(128, 128, 138);                    // grey
-    if (hot || selected) fill = arrow ? RGB(70, 125, 205) : RGB(215, 55, 55);   // arrows turn blue, the minus red
+    if (hot || selected) fill = grip ? RGB(70, 125, 205) : RGB(215, 55, 55);   // the grip turns blue, the minus red
     if (disabled) fill = RGB(72, 72, 80);
     COLORREF bar = disabled ? RGB(112, 112, 120) : RGB(255, 255, 255);
     RECT rc = d->rcItem;
@@ -1710,15 +2341,15 @@ static void DrawMinusButton(const DRAWITEMSTRUCT* d) {   // also draws the up / 
     }
     HBRUSH fillB = CreateSolidBrush(fill);
     HGDIOBJ ob2 = SelectObject(mem, fillB);
-    Ellipse(mem, cx - rad, cy - rad, cx + rad, cy + rad);
+    if (!grip) Ellipse(mem, cx - rad, cy - rad, cx + rad, cy + rad);
     SelectObject(mem, ob2);
     HBRUSH barB = CreateSolidBrush(bar);
-    if (arrow) {   // a small triangle pointing up or down
-        HGDIOBJ ob3 = SelectObject(mem, barB);
-        int t = (int)(rad * 0.52), up = (kind == K_UP) ? -1 : 1;
-        POINT tri[3] = { { cx, cy + up * t }, { cx - t, cy - up * (int)(t * 0.6) }, { cx + t, cy - up * (int)(t * 0.6) } };
-        Polygon(mem, tri, 3);
-        SelectObject(mem, ob3);
+    if (grip) {   // three horizontal lines ("hamburger"), no disc
+        int hw = (int)(rad * 0.85), th = K, gap = (int)(rad * 0.62);
+        for (int k = -1; k <= 1; k++) {
+            RECT line = { cx - hw, cy + k * gap - th, cx + hw, cy + k * gap + th };
+            FillRect(mem, &line, fillB);
+        }
     } else {
         RECT minus = { cx - (int)(rad * 0.58), cy - K, cx + (int)(rad * 0.58), cy + K };
         FillRect(mem, &minus, barB);
@@ -1744,16 +2375,15 @@ static void AddRow(const Account& acc) {
     r.sign = MakeButton(g_panel, RowId(i, K_SIGN), L"SIGN IN", 0, 0, SIGN_W, 28);
     r.stop = MakeButton(g_panel, RowId(i, K_STOP), L"STOP", 0, 0, STOP_W, 28);
     r.status = MakeLabel(g_panel, RowId(i, K_STATUS), L"Idle", 0, 0, 300, 22);
-    r.up = MakeButton(g_panel, RowId(i, K_UP), L"", 0, 0, 24, 24);
-    r.down = MakeButton(g_panel, RowId(i, K_DOWN), L"", 0, 0, 24, 24);
+    r.grip = MakeButton(g_panel, RowId(i, K_GRIP), L"", 0, 0, 24, 24);
     r.del = MakeButton(g_panel, RowId(i, K_DEL), L"", 0, 0, 24, 24);
-    HWND tools[3] = { r.up, r.del, r.down };
-    for (int k = 0; k < 3; k++) {
+    HWND tools[2] = { r.grip, r.del };
+    for (int k = 0; k < 2; k++) {
         SetWindowLongPtrW(tools[k], GWL_STYLE, GetWindowLongPtrW(tools[k], GWL_STYLE) & ~(LONG_PTR)WS_TABSTOP);   // not reachable with the Tab key
         WNDPROC oldTool = (WNDPROC)SetWindowLongPtrW(tools[k], GWLP_WNDPROC, (LONG_PTR)MinusProc);
         SetWindowLongPtrW(tools[k], GWLP_USERDATA, (LONG_PTR)oldTool);
     }
-    if (g_tipMain) { AddTip(g_tipMain, g_hwnd, r.up, L"Move this account up"); AddTip(g_tipMain, g_hwnd, r.down, L"Move this account down"); }
+    if (g_tipMain) AddTip(g_tipMain, g_hwnd, r.grip, kGripTip);
     if (g_tipMain) AddTip(g_tipMain, g_hwnd, r.del, kDelTip);
     r.selected = false;
     GuardEdit(r.user);
@@ -1761,7 +2391,7 @@ static void AddRow(const Account& acc) {
     GuardEdit(r.notes);
     EnableWindow(r.stop, FALSE);
     r.gamePid = 0; r.gameStart = 0; r.gameStartPid = 0; r.titlePid = 0; r.titleSeen = 0;
-    r.pending = false; r.pendingSince = 0; r.statusColor = cGray;
+    r.pending = false; r.pendingSince = 0; r.hideTools = false; r.lastStartClickAt = 0; r.startSawTool = false; r.startToolFirstSeenAt = 0; r.statusColor = cGray;
     r.statusSince = 0; r.statusTransient = false; r.titleLogs = 0;
     g_rows.push_back(r);
 }
@@ -1791,7 +2421,7 @@ static void LayoutRows() {
     RECT pc;
     GetClientRect(g_panel, &pc);
     int statusW = std::max(80, (int)pc.right - X_STATUS - 12);
-    HDWP dwp = BeginDeferWindowPos((int)g_rows.size() * 9 + 1);
+    HDWP dwp = BeginDeferWindowPos((int)g_rows.size() * 8 + 1);
     const UINT f = SWP_NOZORDER | SWP_NOACTIVATE;
     for (size_t i = 0; i < g_rows.size() && dwp; i++) {
         int y = ROW_TOP + (int)i * ROW_H - g_scroll;
@@ -1803,8 +2433,7 @@ static void LayoutRows() {
         if (dwp) dwp = DeferWindowPos(dwp, r.stop, NULL, X_STOP, y - 1, STOP_W, 28, f);
         if (dwp) dwp = DeferWindowPos(dwp, r.status, NULL, X_STATUS, y + 4, statusW, 22, f | SWP_NOCOPYBITS);
         if (dwp) dwp = DeferWindowPos(dwp, r.del, NULL, X_DEL, y + 1, 24, 24, f);
-        if (dwp) dwp = DeferWindowPos(dwp, r.up, NULL, X_UP, y + 1, 24, 24, f);
-        if (dwp) dwp = DeferWindowPos(dwp, r.down, NULL, X_DOWN, y + 1, 24, 24, f);
+        if (dwp) dwp = DeferWindowPos(dwp, r.grip, NULL, X_GRIP, y + 1, 24, 24, f);
     }
     if (dwp) EndDeferWindowPos(dwp);
 }
@@ -2079,7 +2708,7 @@ static void DrawButton(const DRAWITEMSTRUCT* d) {
     wchar_t txt[64];
     GetWindowTextW(d->hwndItem, txt, 64);
     if (id == ID_GEAR || id == ID_LOG) { DrawGearButton(d); return; }
-    if (id >= ID_ROW_BASE && ((id - ID_ROW_BASE) % 10 == K_DEL || (id - ID_ROW_BASE) % 10 == K_UP || (id - ID_ROW_BASE) % 10 == K_DOWN)) { DrawMinusButton(d); return; }
+    if (id >= ID_ROW_BASE && ((id - ID_ROW_BASE) % 10 == K_DEL || (id - ID_ROW_BASE) % 10 == K_GRIP)) { DrawMinusButton(d); return; }
     if (id == ID_MODE) { DrawModeSwitch(d); return; }
     if (id == ID_SHOWPW) {
         int w = rc.right - rc.left, h = rc.bottom - rc.top;
@@ -2146,6 +2775,13 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         POINT o = { 0, 0 };
         MapWindowPoints(hwnd, g_hwnd, &o, 1);
         PaintBg(dc, rc, o.x, o.y);
+        RECT line;
+        DragLineRect(&line);   // the blue line that shows where a dragged row would land
+        if (!IsRectEmpty(&line)) {
+            HBRUSH lb = CreateSolidBrush(RGB(70, 125, 205));
+            FillRect(dc, &line, lb);
+            DeleteObject(lb);
+        }
         return 1;
     }
     case WM_SIZE:
@@ -2192,19 +2828,29 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 enum {
     ID_S_ARC = 2000, ID_S_ARCBROWSE, ID_S_W, ID_S_H, ID_S_REMEMBER, ID_S_AUTOFILL,
     ID_S_UTABS, ID_S_FTABS, ID_S_LOGINMS, ID_S_MINWAIT, ID_S_WINTIMEOUT,
-    ID_S_CLOSE_LAUNCHER, ID_S_CLOSE_GAME, ID_S_LGRACE, ID_S_GRACE, ID_S_TIMEOUT, ID_S_PENDING,
+    ID_S_MODE_HIDDEN, ID_S_MODE_SHOW, ID_S_TIMEOUT, ID_S_PENDING,
     ID_S_CONFIRM, ID_S_KILL, ID_S_DEBUG, ID_S_RENAME, ID_S_STORAGE, ID_S_RENDUR, ID_S_STATRESET,
     ID_S_BG, ID_S_BGBROWSE, ID_S_MODE0, ID_S_MODE1, ID_S_MODE2, ID_S_MODE3, ID_S_MODE4,
-    ID_S_DIM, ID_S_DIMLBL, ID_S_DEFAULTS, ID_S_SAVE, ID_S_CANCEL, ID_S_PAGE_BASIC, ID_S_PAGE_ADV, ID_S_PAGE_PRIV, ID_S_FOLDER,
+    ID_S_DIM, ID_S_DIMLBL, ID_S_DEFAULTS, ID_S_SAVE, ID_S_CANCEL,
+    ID_S_PAGE_BASIC, ID_S_PAGE_ADV, ID_S_PAGE_PRIV, ID_S_FOLDER,
+    ID_S_ADV_SUB_SHARED, ID_S_ADV_SUB_HIDDEN, ID_S_ADV_SUB_SHOW,
     ID_S_PRIV_PATH, ID_S_PRIV_PATHBROWSE, ID_S_PRIV_FLAGS, ID_S_PRIV_WARN, ID_S_PRIV_PROCS, ID_S_PRIV_WINWAIT, ID_S_PRIV_FIRSTKEY,
     ID_S_PRIV_ENTERS, ID_S_PRIV_PAUSEPOP, ID_S_PRIV_PAUSESTEP, ID_S_PRIV_TABS, ID_S_PRIV_CLEAR, ID_S_PRIV_ENTERAFTER,
     ID_S_PRIV_KEY_ENTER, ID_S_PRIV_KEY_ESC,
-    ID_S_POP_COUNT, ID_S_POP_PAUSE, ID_S_POP_CLEAR, ID_S_POP_ENTERAFTER, ID_S_POP_KEY_ENTER, ID_S_POP_KEY_ESC
+    ID_S_POP_COUNT, ID_S_POP_PAUSE, ID_S_POP_CLEAR, ID_S_POP_ENTERAFTER, ID_S_POP_KEY_ENTER, ID_S_POP_KEY_ESC,
+    ID_S_HL_KEYDELAY, ID_S_HL_CHARDELAY, ID_S_HL_POSTTAB, ID_S_HL_POSTFIELD, ID_S_HL_HIDESETTLE,
+    ID_S_HL_SIGNINTIMEOUT, ID_S_HL_SIGNINPOLL,
+    ID_S_HL_MAININITDELAY, ID_S_HL_MAINTIMEOUT, ID_S_HL_MAINPOLL,
+    ID_S_HL_PATCHERTIMEOUT, ID_S_HL_PATCHERPOLL,
+    ID_S_CLICKSTART, ID_S_START_POLL, ID_S_START_TIMEOUT,
+    ID_S_CLICKPLAY
 };
 
 static HWND g_setWnd = NULL;       // the settings window (NULL while closed)
-static std::vector<HWND> g_pageBasic, g_pageAdv, g_pagePriv;       // the controls of the two pages (Basic / Advanced)
+static std::vector<HWND> g_pageBasic, g_pageAdv, g_pagePriv;       // the controls of each top-level page (g_pageAdv = both Advanced sub-tabs together)
+static std::vector<HWND> g_pageAdvShared, g_pageAdvHidden, g_pageAdvShow;           // which of the Advanced page's controls belong to which sub-tab
 static std::vector<HWND>* g_pageList = NULL;           // while building: which page the new controls belong to
+static int g_advSub = 0;           // 0 = Shared (default), 1 = Hidden Arc Mode, 2 = Show Arc Mode (the three Advanced sub-tabs)
 static HWND g_setTip = NULL;
 static bool g_setDirty = false;    // something was changed and not saved yet
 static bool g_setLoading = false;  // true while the controls are being filled in by the program
@@ -2219,13 +2865,11 @@ static const NumField kNumFields[] = {
     { ID_S_LOGINMS,    L"LoginDelayMs",         L"Login delay (milliseconds)",   &Settings::loginDelayMs,         0,   60000 },
     { ID_S_MINWAIT,    L"MinWaitSeconds",       L"Minimum wait (seconds)",       &Settings::minWaitSeconds,       0,   600 },
     { ID_S_WINTIMEOUT, L"WindowTimeoutSeconds", L"Login window timeout (seconds)", &Settings::windowTimeoutSeconds, 1, 600 },
-    { ID_S_LGRACE,     L"LauncherGraceSeconds", L"Delay after launcher (seconds)", &Settings::launcherGraceSeconds, 0,  600 },
-    { ID_S_GRACE,      L"GraceSeconds",         L"Delay after game (seconds)",   &Settings::graceSeconds,         0,   600 },
     { ID_S_TIMEOUT,    L"TimeoutSeconds",       L"Give up after (seconds)",      &Settings::timeoutSeconds,       10,  86400 },
     { ID_S_PENDING,    L"PendingTimeoutSeconds", L"Game wait after close (seconds)", &Settings::pendingTimeoutSeconds, 10, 86400 },
     { ID_S_RENDUR,     L"RenameDurationSeconds", L"Rename duration (seconds)",   &Settings::renameDurationSeconds, 10, 3600 },
     { ID_S_STATRESET,  L"StatusResetSeconds",    L"Reset status after (seconds)", &Settings::statusResetSeconds, 0, 86400 },
-    // private servers (index 13 and up)
+    // private servers
     { ID_S_PRIV_WINWAIT,   L"PrivateWindowWaitSeconds",    L"Wait for the game window (sec)", &Settings::privWindowWait,   1, 3600 },
     { ID_S_PRIV_FIRSTKEY,  L"PrivateFirstKeyDelaySeconds", L"Wait before the first key (sec)", &Settings::privFirstKey,   0, 600 },
     { ID_S_PRIV_ENTERS,    L"PrivateEntersBefore",         L"Enter/Escape presses for the pop-up",   &Settings::privEnters,       0, 10 },
@@ -2233,10 +2877,26 @@ static const NumField kNumFields[] = {
     { ID_S_PRIV_PAUSESTEP, L"PrivatePauseStepMs",          L"Pause between steps (ms)",       &Settings::privPauseStep,    0, 60000 },
     { ID_S_PRIV_TABS,      L"PrivateTabs",                 L"Tabs between the two boxes",     &Settings::privTabs,         0, 10 },
     { ID_S_PRIV_CLEAR,     L"PrivateClearBackspaces",      L"Backspaces to clear a box",      &Settings::privClear,        0, 60 },
-    // login pop-up and typing for the official game (index 20 and up)
+    // login pop-up and typing for the official game
     { ID_S_POP_COUNT,      L"EntersBefore",                L"Enter/Escape presses for the pop-up", &Settings::popPresses,  0, 10 },
     { ID_S_POP_PAUSE,      L"PauseAfterPopupMs",           L"Pause after the pop-up (ms)",    &Settings::popPause,         0, 60000 },
     { ID_S_POP_CLEAR,      L"ClearBackspaces",             L"Backspaces to clear a box",      &Settings::clearBs,          0, 60 },
+    // hidden login
+    { ID_S_HL_KEYDELAY,      L"HiddenKeyDelayMs",              L"Key press delay (ms)",            &Settings::hlKeyDelayMs,              0, 5000 },
+    { ID_S_HL_CHARDELAY,     L"HiddenCharDelayMs",             L"Typed character delay (ms)",      &Settings::hlCharDelayMs,             0, 5000 },
+    { ID_S_HL_POSTTAB,       L"HiddenPostTabDelayMs",          L"Pause after Tab (ms)",            &Settings::hlPostTabDelayMs,          0, 5000 },
+    { ID_S_HL_POSTFIELD,     L"HiddenPostFieldDelayMs",        L"Pause after a field (ms)",        &Settings::hlPostFieldDelayMs,        0, 5000 },
+    { ID_S_HL_HIDESETTLE,    L"HiddenHideSettleDelayMs",       L"Pause after hiding Sign In (ms)", &Settings::hlHideSettleDelayMs,       0, 5000 },
+    { ID_S_HL_SIGNINTIMEOUT, L"HiddenSignInTimeoutSeconds",    L"Sign In window timeout (sec)",    &Settings::hlSignInTimeoutSec,        1, 3600 },
+    { ID_S_HL_SIGNINPOLL,    L"HiddenSignInPollIntervalMs",    L"Sign In poll interval (ms)",       &Settings::hlSignInPollIntervalMs,    50, 60000 },
+    { ID_S_HL_MAININITDELAY, L"HiddenMainWindowInitialDelayMs", L"Initial delay before Play (ms)", &Settings::hlMainWindowInitialDelayMs, 0, 60000 },
+    { ID_S_HL_MAINTIMEOUT,   L"HiddenMainWindowTimeoutSeconds", L"Main window timeout (sec)",      &Settings::hlMainWindowTimeoutSec,    1, 3600 },
+    { ID_S_HL_MAINPOLL,      L"HiddenMainWindowPollIntervalMs", L"Main window poll interval (ms)", &Settings::hlMainWindowPollIntervalMs, 50, 60000 },
+    { ID_S_HL_PATCHERTIMEOUT,L"HiddenPatcherWaitTimeoutSeconds", L"Patcher wait timeout (sec)",    &Settings::hlPatcherWaitTimeoutSec,   1, 3600 },
+    { ID_S_HL_PATCHERPOLL,   L"HiddenPatcherWaitPollIntervalMs", L"Patcher poll interval (ms)",    &Settings::hlPatcherWaitPollIntervalMs, 50, 60000 },
+    // clicking Start on the launcher/patcher (applies to both Launcher Modes)
+    { ID_S_START_POLL,       L"PatcherStartPollIntervalMs",     L"Click Start every (ms)",          &Settings::patcherStartPollIntervalMs, 200, 60000 },
+    { ID_S_START_TIMEOUT,    L"PatcherStartTimeoutSeconds",     L"Give up clicking after (sec)",    &Settings::patcherStartTimeoutSec,    1, 3600 },
 };
 // on/off settings: tick boxes in the window
 struct BoolField { int id; const wchar_t* key; bool Settings::* mem; };
@@ -2251,16 +2911,37 @@ static const BoolField kBoolFields[] = {
     { ID_S_PRIV_ENTERAFTER, L"PrivateEnterAfterPassword", &Settings::privEnterAfter },
     { ID_S_PRIV_WARN, L"PrivateShowWarning", &Settings::privShowWarning },
     { ID_S_POP_ENTERAFTER, L"EnterAfterPassword", &Settings::enterAfterPw },
+    { ID_S_CLICKSTART, L"ClickPatcherStart", &Settings::clickPatcherStart },
+    { ID_S_CLICKPLAY, L"ClickArcPlay", &Settings::clickArcPlay },
 };
+// the text-box label of a whole-number setting, found by its control id (so reordering the table can never mislabel a box)
+static const wchar_t* NumLabel(int id) {
+    for (size_t i = 0; i < sizeof(kNumFields) / sizeof(kNumFields[0]); i++) if (kNumFields[i].id == id) return kNumFields[i].label;
+    return L"";
+}
 static const wchar_t* const kModeNames[5]  = { L"fill", L"fit", L"stretch", L"tile", L"center" };
 static const wchar_t* const kModeLabels[5] = { L"Fill", L"Fit", L"Stretch", L"Tile", L"Center" };
 
 static HWND SCtl(int id) { return GetDlgItem(g_setWnd, id); }
+// which of the three Advanced sub-tabs is showing (only matters while page 1 itself is showing)
+static void ShowAdvSub(int sub) {
+    g_advSub = (sub == 1 || sub == 2) ? sub : 0;
+    for (size_t i = 0; i < g_pageAdvShared.size(); i++) ShowWindow(g_pageAdvShared[i], g_advSub == 0 ? SW_SHOW : SW_HIDE);
+    for (size_t i = 0; i < g_pageAdvHidden.size(); i++) ShowWindow(g_pageAdvHidden[i], g_advSub == 1 ? SW_SHOW : SW_HIDE);
+    for (size_t i = 0; i < g_pageAdvShow.size(); i++) ShowWindow(g_pageAdvShow[i], g_advSub == 2 ? SW_SHOW : SW_HIDE);
+    int subIds[3] = { ID_S_ADV_SUB_SHARED, ID_S_ADV_SUB_HIDDEN, ID_S_ADV_SUB_SHOW };
+    CheckRadioButton(g_setWnd, ID_S_ADV_SUB_SHARED, ID_S_ADV_SUB_SHOW, subIds[g_advSub]);
+}
 static void ShowSettingsPage(int page) {
     for (size_t i = 0; i < g_pageBasic.size(); i++) ShowWindow(g_pageBasic[i], page == 0 ? SW_SHOW : SW_HIDE);
     for (size_t i = 0; i < g_pageAdv.size(); i++) ShowWindow(g_pageAdv[i], page == 1 ? SW_SHOW : SW_HIDE);
     for (size_t i = 0; i < g_pagePriv.size(); i++) ShowWindow(g_pagePriv[i], page == 2 ? SW_SHOW : SW_HIDE);
-    CheckRadioButton(g_setWnd, ID_S_PAGE_BASIC, ID_S_PAGE_PRIV, page == 0 ? ID_S_PAGE_BASIC : (page == 1 ? ID_S_PAGE_ADV : ID_S_PAGE_PRIV));
+    bool onAdv = (page == 1);
+    for (size_t i = 0; i < g_pageAdvShared.size(); i++) ShowWindow(g_pageAdvShared[i], (onAdv && g_advSub == 0) ? SW_SHOW : SW_HIDE);
+    for (size_t i = 0; i < g_pageAdvHidden.size(); i++) ShowWindow(g_pageAdvHidden[i], (onAdv && g_advSub == 1) ? SW_SHOW : SW_HIDE);
+    for (size_t i = 0; i < g_pageAdvShow.size(); i++) ShowWindow(g_pageAdvShow[i], (onAdv && g_advSub == 2) ? SW_SHOW : SW_HIDE);
+    int ids[3] = { ID_S_PAGE_BASIC, ID_S_PAGE_ADV, ID_S_PAGE_PRIV };
+    CheckRadioButton(g_setWnd, ID_S_PAGE_BASIC, ID_S_PAGE_PRIV, ids[page >= 0 && page <= 2 ? page : 0]);
 }
 static HWND SMake(const wchar_t* cls, const wchar_t* text, DWORD style, DWORD ex, int x, int y, int w, int h, int id) {
     HWND c = CreateWindowExW(ex, cls, text, WS_CHILD | WS_VISIBLE | style, x, y, w, h, g_setWnd, (HMENU)(INT_PTR)id, g_hInst, NULL);
@@ -2295,19 +2976,28 @@ static void SettingsUpdateEnabled() {
     bool af = Checked(ID_S_AUTOFILL);
     const int fillIds[] = { ID_S_UTABS, ID_S_FTABS, ID_S_LOGINMS, ID_S_MINWAIT, ID_S_WINTIMEOUT };
     for (size_t i = 0; i < sizeof(fillIds) / sizeof(fillIds[0]); i++) EnableWindow(SCtl(fillIds[i]), af && !priv);
-    bool launcher = Checked(ID_S_CLOSE_LAUNCHER);
-    EnableWindow(SCtl(ID_S_LGRACE), launcher && !priv);
-    EnableWindow(SCtl(ID_S_PENDING), launcher && !priv);
-    EnableWindow(SCtl(ID_S_GRACE), !launcher && !priv);
+    EnableWindow(SCtl(ID_S_PENDING), !priv);
     EnableWindow(SCtl(ID_S_TIMEOUT), !priv);
     EnableWindow(SCtl(ID_S_RENDUR), Checked(ID_S_RENAME));
     const int popIds[] = { ID_S_POP_COUNT, ID_S_POP_PAUSE, ID_S_POP_CLEAR, ID_S_POP_ENTERAFTER, ID_S_POP_KEY_ENTER, ID_S_POP_KEY_ESC };
-    for (size_t i = 0; i < sizeof(popIds) / sizeof(popIds[0]); i++) EnableWindow(SCtl(popIds[i]), af && !priv);
     EnableWindow(SCtl(ID_S_ARC), !priv);
     EnableWindow(SCtl(ID_S_ARCBROWSE), !priv);
-    EnableWindow(SCtl(ID_S_CLOSE_LAUNCHER), !priv);
-    EnableWindow(SCtl(ID_S_CLOSE_GAME), !priv);
+    EnableWindow(SCtl(ID_S_MODE_HIDDEN), !priv);
+    EnableWindow(SCtl(ID_S_MODE_SHOW), !priv);
     EnableWindow(SCtl(ID_S_KILL), !priv);
+    EnableWindow(SCtl(ID_S_CLICKSTART), !priv && !Checked(ID_S_MODE_HIDDEN));   // Show Arc Mode only - Hidden Arc Mode always clicks Start
+    EnableWindow(SCtl(ID_S_START_POLL), !priv && (Checked(ID_S_CLICKSTART) || Checked(ID_S_MODE_HIDDEN)));
+    EnableWindow(SCtl(ID_S_START_TIMEOUT), !priv && (Checked(ID_S_CLICKSTART) || Checked(ID_S_MODE_HIDDEN)));
+    // the old pop-up method's fields (Show Arc Mode) are greyed out while Hidden Arc Mode is selected, and vice versa
+    bool hl = Checked(ID_S_MODE_HIDDEN);
+    for (size_t i = 0; i < sizeof(popIds) / sizeof(popIds[0]); i++) EnableWindow(SCtl(popIds[i]), af && !priv && !hl);
+    for (size_t i = 0; i < sizeof(fillIds) / sizeof(fillIds[0]); i++) EnableWindow(SCtl(fillIds[i]), af && !priv && !hl);
+    EnableWindow(SCtl(ID_S_AUTOFILL), !priv && !hl);
+    EnableWindow(SCtl(ID_S_CLICKPLAY), af && !priv && !hl);   // Show Arc Mode only - needs auto-fill to have submitted the credentials first
+    const int hlIds[] = { ID_S_HL_KEYDELAY, ID_S_HL_CHARDELAY, ID_S_HL_POSTTAB, ID_S_HL_POSTFIELD, ID_S_HL_HIDESETTLE,
+                           ID_S_HL_SIGNINTIMEOUT, ID_S_HL_SIGNINPOLL, ID_S_HL_MAININITDELAY, ID_S_HL_MAINTIMEOUT,
+                           ID_S_HL_MAINPOLL, ID_S_HL_PATCHERTIMEOUT, ID_S_HL_PATCHERPOLL };
+    for (size_t i = 0; i < sizeof(hlIds) / sizeof(hlIds[0]); i++) EnableWindow(SCtl(hlIds[i]), hl && !priv);
 }
 static void SettingsToUi(const Settings& v) {
     g_setLoading = true;
@@ -2321,7 +3011,7 @@ static void SettingsToUi(const Settings& v) {
         SendMessageW(SCtl(kBoolFields[i].id), BM_SETCHECK, (v.*(kBoolFields[i].mem)) ? BST_CHECKED : BST_UNCHECKED, 0);
     CheckRadioButton(g_setWnd, ID_S_PRIV_KEY_ENTER, ID_S_PRIV_KEY_ESC, v.privPopupEsc ? ID_S_PRIV_KEY_ESC : ID_S_PRIV_KEY_ENTER);
     CheckRadioButton(g_setWnd, ID_S_POP_KEY_ENTER, ID_S_POP_KEY_ESC, v.popEsc ? ID_S_POP_KEY_ESC : ID_S_POP_KEY_ENTER);
-    CheckRadioButton(g_setWnd, ID_S_CLOSE_LAUNCHER, ID_S_CLOSE_GAME, v.closeAtLauncher ? ID_S_CLOSE_LAUNCHER : ID_S_CLOSE_GAME);
+    CheckRadioButton(g_setWnd, ID_S_MODE_HIDDEN, ID_S_MODE_SHOW, v.useHiddenLogin ? ID_S_MODE_HIDDEN : ID_S_MODE_SHOW);
     SetWindowTextW(SCtl(ID_S_BG), v.bgImage.c_str());
     int mode = 0;
     for (int i = 0; i < 5; i++) if (v.bgMode == kModeNames[i]) mode = i;
@@ -2367,7 +3057,7 @@ static bool UiToSettings(Settings& n) {
         n.*(f.mem) = (int)v;
     }
     for (size_t i = 0; i < sizeof(kBoolFields) / sizeof(kBoolFields[0]); i++) n.*(kBoolFields[i].mem) = Checked(kBoolFields[i].id);
-    n.closeAtLauncher = Checked(ID_S_CLOSE_LAUNCHER);
+    n.useHiddenLogin = Checked(ID_S_MODE_HIDDEN);
     n.privPopupEsc = Checked(ID_S_PRIV_KEY_ESC);
     n.popEsc = Checked(ID_S_POP_KEY_ESC);
     std::wstring bg = Trim(GetText(SCtl(ID_S_BG)));
@@ -2399,7 +3089,7 @@ static bool WriteSettingsToIni(const Settings& s) {
     ok = IniPutStr(L"PrivateProcessNames", s.privProcNames) && ok;
     for (size_t i = 0; i < sizeof(kNumFields) / sizeof(kNumFields[0]); i++) ok = IniPutInt(kNumFields[i].key, s.*(kNumFields[i].mem)) && ok;
     for (size_t i = 0; i < sizeof(kBoolFields) / sizeof(kBoolFields[0]); i++) ok = IniPutInt(kBoolFields[i].key, (s.*(kBoolFields[i].mem)) ? 1 : 0) && ok;
-    ok = IniPutStr(L"CloseArcAt", s.closeAtLauncher ? L"launcher" : L"game") && ok;
+    ok = IniPutInt(L"UseHiddenLogin", s.useHiddenLogin ? 1 : 0) && ok;
     ok = IniPutStr(L"PrivatePopupKey", s.privPopupEsc ? L"escape" : L"enter") && ok;
     ok = IniPutStr(L"PopupKey", s.popEsc ? L"escape" : L"enter") && ok;
     ok = IniPutStr(L"BackgroundImage", s.bgImage) && ok;
@@ -2493,11 +3183,15 @@ static void BuildSettingsWindow() {
     g_pageBasic.clear();
     g_pageAdv.clear();
     g_pagePriv.clear();
+    g_pageAdvShared.clear();
+    g_pageAdvHidden.clear();
+    g_pageAdvShow.clear();
+    g_advSub = 0;
     g_pageList = NULL;
     g_setTip = MakeTooltips(g_setWnd);
     HWND title = SLabel(L"CONFIGURATION", 16, 8, 250, 36);
     SendMessageW(title, WM_SETFONT, (WPARAM)g_fontTitle, TRUE);
-    // two push-like radio buttons switch between the pages
+    // push-like radio buttons switch between the pages
     SMake(L"BUTTON", L"Basic", BS_AUTORADIOBUTTON | BS_PUSHLIKE | WS_GROUP | WS_TABSTOP, 0, 276, 14, 70, 26, ID_S_PAGE_BASIC);
     SMake(L"BUTTON", L"Advanced", BS_AUTORADIOBUTTON | BS_PUSHLIKE, 0, 350, 14, 84, 26, ID_S_PAGE_ADV);
     SMake(L"BUTTON", L"Private Servers", BS_AUTORADIOBUTTON | BS_PUSHLIKE, 0, 438, 14, 186, 26, ID_S_PAGE_PRIV);
@@ -2515,59 +3209,99 @@ static void BuildSettingsWindow() {
     SLabel(L"pixels", 256, 131, 50, 18);
     SCheck(ID_S_REMEMBER, L"Remember the size when closing", 28, 158, 280, 20);
 
-    SGroup(L"Close Arc when", 16, 198, 300, 82);
-    SRadio(ID_S_CLOSE_LAUNCHER, L"The launcher starts", 28, 220, 270, 20, true);
-    SRadio(ID_S_CLOSE_GAME, L"The game client starts", 28, 244, 270, 20, false);
+    SGroup(L"Launcher Mode", 16, 198, 300, 82);
+    SRadio(ID_S_MODE_HIDDEN, L"Hidden Arc Mode", 28, 220, 270, 20, true);
+    SRadio(ID_S_MODE_SHOW, L"Show Arc Mode", 28, 244, 270, 20, false);
 
-    SGroup(L"Options", 332, 106, 292, 174);
+    SGroup(L"Options", 332, 106, 292, 222);
     SCheck(ID_S_DEBUG, L"Debug / Logs", 344, 130, 270, 20);
     SCheck(ID_S_KILL, L"Close running Arc at start / sign-in", 344, 154, 270, 20);
     SCheck(ID_S_AUTOFILL, L"Auto-fill username and password", 344, 178, 270, 20);
-    SCheck(ID_S_RENAME, L"Rename game windows to Notes", 344, 202, 270, 20);
-    SCheck(ID_S_CONFIRM, L"Ask before stopping a game client", 344, 226, 270, 20);
-    SCheck(ID_S_STORAGE, L"Show plain-text storage notice", 344, 250, 270, 20);
+    SCheck(ID_S_CLICKPLAY, L"Auto-click Play (arc)", 344, 202, 270, 20);
+    SCheck(ID_S_CLICKSTART, L"Auto-click Start (launcher/patcher)", 344, 226, 270, 20);
+    SCheck(ID_S_RENAME, L"Rename game windows to Notes", 344, 250, 270, 20);
+    SCheck(ID_S_CONFIRM, L"Ask before stopping a game client", 344, 274, 270, 20);
+    SCheck(ID_S_STORAGE, L"Show plain-text storage notice", 344, 298, 270, 20);
 
-    SGroup(L"Background", 16, 288, 608, 146);
-    SLabel(L"Background Image Location", 28, 310, 300, 18);
-    SEdit(ID_S_BG, 28, 330, 496, 22, false, false);
-    SButton(ID_S_BGBROWSE, L"Browse...", 532, 329, 80, 24, false);
-    SLabel(L"Mode", 28, 368, 44, 18);
-    for (int i = 0; i < 5; i++) SRadio(ID_S_MODE0 + i, kModeLabels[i], 74 + i * 96, 366, 92, 20, i == 0);
-    SLabel(L"Darkness", 28, 400, 62, 18);
+    SGroup(L"Background", 16, 336, 608, 146);
+    SLabel(L"Background Image Location", 28, 334, 300, 18);
+    SEdit(ID_S_BG, 28, 354, 496, 22, false, false);
+    SButton(ID_S_BGBROWSE, L"Browse...", 532, 353, 80, 24, false);
+    SLabel(L"Mode", 28, 392, 44, 18);
+    for (int i = 0; i < 5; i++) SRadio(ID_S_MODE0 + i, kModeLabels[i], 74 + i * 96, 390, 92, 20, i == 0);
+    SLabel(L"Darkness", 28, 424, 62, 18);
     HWND tb = CreateWindowExW(0, L"msctls_trackbar32", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_GROUP | TBS_AUTOTICKS,
-                              92, 394, 420, 30, g_setWnd, (HMENU)(INT_PTR)ID_S_DIM, g_hInst, NULL);
+                              92, 418, 420, 30, g_setWnd, (HMENU)(INT_PTR)ID_S_DIM, g_hInst, NULL);
     g_pageBasic.push_back(tb);
     SendMessageW(tb, TBM_SETRANGE, TRUE, MAKELONG(0, 100));
     SendMessageW(tb, TBM_SETTICFREQ, 10, 0);
     SendMessageW(tb, TBM_SETPAGESIZE, 0, 10);
-    SMake(L"STATIC", L"50%", SS_LEFT | SS_NOPREFIX, 0, 520, 400, 80, 18, ID_S_DIMLBL);
+    SMake(L"STATIC", L"50%", SS_LEFT | SS_NOPREFIX, 0, 520, 424, 80, 18, ID_S_DIMLBL);
 
-    // ======== page 2: Advanced (rarely needs changing)
+    // ======== page 2: Advanced - one shared description, then two sub-tabs: Hidden Arc Mode (default) and Show Arc Mode
     g_pageList = &g_pageAdv;
     SLabel(L"Timing and fine-tuning. The defaults suit most computers.", 16, 108, 608, 18);
-    SGroup(L"Signing in", 16, 134, 300, 200);
+    SMake(L"BUTTON", L"Shared Settings", BS_AUTORADIOBUTTON | BS_PUSHLIKE | WS_GROUP | WS_TABSTOP, 0, 16, 132, 150, 24, ID_S_ADV_SUB_SHARED);
+    SMake(L"BUTTON", L"Hidden Arc Mode", BS_AUTORADIOBUTTON | BS_PUSHLIKE, 0, 172, 132, 150, 24, ID_S_ADV_SUB_HIDDEN);
+    SMake(L"BUTTON", L"Show Arc Mode", BS_AUTORADIOBUTTON | BS_PUSHLIKE, 0, 328, 132, 150, 24, ID_S_ADV_SUB_SHOW);
+
+    // ---- Advanced / Shared Settings sub-tab (used by both Launcher Modes)
+    g_pageList = &g_pageAdvShared;
+    SGroup(L"Game clients and windows", 16, 164, 300, 140);
+    const int sharedIds[3] = { ID_S_PENDING, ID_S_RENDUR, ID_S_STATRESET };
+    for (int i = 0; i < 3; i++) {
+        int y = 192 + i * 30;
+        SLabel(NumLabel(sharedIds[i]), 28, y + 3, 205, 18);
+        SEdit(sharedIds[i], 240, y, 58, 22, true, false);
+    }
+    SGroup(L"Clicking Start (launcher / patcher)", 332, 164, 292, 100);
+    const int startIds[2] = { ID_S_START_POLL, ID_S_START_TIMEOUT };
+    for (int i = 0; i < 2; i++) {
+        int y = 192 + i * 30;
+        SLabel(NumLabel(startIds[i]), 344, y + 3, 210, 18);
+        SEdit(startIds[i], 556, y, 56, 22, true, false);
+    }
+
+    // ---- Advanced / Show Arc Mode sub-tab (the old visible pop-up method's timing)
+    g_pageList = &g_pageAdvShow;
+    SGroup(L"Signing in", 16, 164, 300, 200);
     const int signIds[5] = { ID_S_UTABS, ID_S_FTABS, ID_S_LOGINMS, ID_S_MINWAIT, ID_S_WINTIMEOUT };
-    const int signIdx[5] = { 2, 3, 4, 5, 6 };
     for (int i = 0; i < 5; i++) {
-        int y = 160 + i * 30;
-        SLabel(kNumFields[signIdx[i]].label, 28, y + 3, 205, 18);
+        int y = 190 + i * 30;
+        SLabel(NumLabel(signIds[i]), 28, y + 3, 205, 18);
         SEdit(signIds[i], 240, y, 58, 22, true, false);
     }
-    SGroup(L"Closing Arc and other", 332, 134, 292, 200);
-    const int closeIds[6] = { ID_S_LGRACE, ID_S_GRACE, ID_S_TIMEOUT, ID_S_PENDING, ID_S_RENDUR, ID_S_STATRESET };
-    for (int i = 0; i < 6; i++) {
-        int y = 160 + i * 28;
-        SLabel(kNumFields[7 + i].label, 344, y + 3, 210, 18);
-        SEdit(closeIds[i], 556, y, 56, 22, true, false);
+    SGroup(L"Waiting for the game", 332, 164, 292, 62);
+    SLabel(NumLabel(ID_S_TIMEOUT), 344, 193, 210, 18); SEdit(ID_S_TIMEOUT, 556, 190, 56, 22, true, false);
+    SGroup(L"Login pop-up and typing", 16, 372, 608, 104);
+    SLabel(NumLabel(ID_S_POP_COUNT), 28, 399, 235, 18); SEdit(ID_S_POP_COUNT, 270, 396, 50, 22, true, false);
+    SLabel(L"Key for the pop-up", 28, 425, 120, 18);
+    SRadio(ID_S_POP_KEY_ENTER, L"Enter", 160, 422, 70, 20, true);
+    SRadio(ID_S_POP_KEY_ESC, L"Escape", 240, 422, 72, 20, false);
+    SLabel(NumLabel(ID_S_POP_PAUSE), 28, 451, 235, 18); SEdit(ID_S_POP_PAUSE, 270, 448, 50, 22, true, true);   // (ends the radio group)
+    SLabel(NumLabel(ID_S_POP_CLEAR), 344, 399, 210, 18); SEdit(ID_S_POP_CLEAR, 566, 396, 50, 22, true, false);
+    SCheck(ID_S_POP_ENTERAFTER, L"Press Enter after the password", 344, 424, 270, 20);
+
+    // ---- Advanced / Hidden Arc Mode sub-tab (the hidden sign-in's timing)
+    g_pageList = &g_pageAdvHidden;
+    SGroup(L"Signing in (hidden)", 16, 164, 300, 212);
+    const int hlSignIds[7] = { ID_S_HL_KEYDELAY, ID_S_HL_CHARDELAY, ID_S_HL_POSTTAB, ID_S_HL_POSTFIELD, ID_S_HL_HIDESETTLE, ID_S_HL_SIGNINTIMEOUT, ID_S_HL_SIGNINPOLL };
+    for (int i = 0; i < 7; i++) {
+        int y = 188 + i * 24;
+        SLabel(NumLabel(hlSignIds[i]), 28, y + 3, 205, 18);
+        SEdit(hlSignIds[i], 240, y, 58, 22, true, false);
     }
-    SGroup(L"Login pop-up and typing", 16, 342, 608, 104);
-    SLabel(kNumFields[20].label, 28, 369, 235, 18); SEdit(ID_S_POP_COUNT, 270, 366, 50, 22, true, false);
-    SLabel(L"Key for the pop-up", 28, 395, 120, 18);
-    SRadio(ID_S_POP_KEY_ENTER, L"Enter", 160, 392, 70, 20, true);
-    SRadio(ID_S_POP_KEY_ESC, L"Escape", 240, 392, 72, 20, false);
-    SLabel(kNumFields[21].label, 28, 421, 235, 18); SEdit(ID_S_POP_PAUSE, 270, 418, 50, 22, true, true);   // (ends the radio group)
-    SLabel(kNumFields[22].label, 344, 369, 210, 18); SEdit(ID_S_POP_CLEAR, 566, 366, 50, 22, true, false);
-    SCheck(ID_S_POP_ENTERAFTER, L"Press Enter after the password", 344, 394, 270, 20);
+    SGroup(L"After sign-in (clicking Play)", 332, 164, 292, 100);
+    const int hlPlayIds[3] = { ID_S_HL_MAININITDELAY, ID_S_HL_MAINTIMEOUT, ID_S_HL_MAINPOLL };
+    for (int i = 0; i < 3; i++) {
+        int y = 190 + i * 26;
+        SLabel(NumLabel(hlPlayIds[i]), 344, y + 3, 210, 18);
+        SEdit(hlPlayIds[i], 556, y, 56, 22, true, false);
+    }
+    SGroup(L"Waiting for the launcher / patcher", 332, 276, 292, 80);
+    SLabel(NumLabel(ID_S_HL_PATCHERTIMEOUT), 344, 302, 210, 18); SEdit(ID_S_HL_PATCHERTIMEOUT, 556, 299, 56, 22, true, false);
+    SLabel(NumLabel(ID_S_HL_PATCHERPOLL), 344, 329, 210, 18); SEdit(ID_S_HL_PATCHERPOLL, 556, 326, 56, 22, true, false);
+
     // ======== page 3: Private Servers
     g_pageList = &g_pagePriv;
     SLabel(L"Used while the switch at the top of the main window is set to Private Servers. Arc is not used in that mode.", 16, 108, 608, 18);
@@ -2580,35 +3314,56 @@ static void BuildSettingsWindow() {
     SGroup(L"Game client", 16, 262, 300, 180);
     SLabel(L"Process name(s) to wait for (use commas)", 28, 284, 280, 18);
     SEdit(ID_S_PRIV_PROCS, 28, 304, 272, 22, false, false);
-    SLabel(kNumFields[13].label, 28, 342, 205, 18); SEdit(ID_S_PRIV_WINWAIT, 240, 339, 58, 22, true, false);
-    SLabel(kNumFields[14].label, 28, 370, 205, 18); SEdit(ID_S_PRIV_FIRSTKEY, 240, 367, 58, 22, true, false);
+    SLabel(NumLabel(ID_S_PRIV_WINWAIT), 28, 342, 205, 18); SEdit(ID_S_PRIV_WINWAIT, 240, 339, 58, 22, true, false);
+    SLabel(NumLabel(ID_S_PRIV_FIRSTKEY), 28, 370, 205, 18); SEdit(ID_S_PRIV_FIRSTKEY, 240, 367, 58, 22, true, false);
     SCheck(ID_S_PRIV_ENTERAFTER, L"Press Enter after the password", 28, 396, 270, 20);
     SGroup(L"Typing sequence", 332, 262, 292, 180);
-    SLabel(kNumFields[15].label, 344, 289, 220, 18); SEdit(ID_S_PRIV_ENTERS, 566, 286, 50, 22, true, false);
+    SLabel(NumLabel(ID_S_PRIV_ENTERS), 344, 289, 220, 18); SEdit(ID_S_PRIV_ENTERS, 566, 286, 50, 22, true, false);
     SLabel(L"Key for the pop-up", 344, 317, 120, 18);
     SRadio(ID_S_PRIV_KEY_ENTER, L"Enter", 470, 314, 70, 20, true);
     SRadio(ID_S_PRIV_KEY_ESC, L"Escape", 544, 314, 72, 20, false);
     const int typIds[4] = { ID_S_PRIV_PAUSEPOP, ID_S_PRIV_PAUSESTEP, ID_S_PRIV_TABS, ID_S_PRIV_CLEAR };
     for (int i = 0; i < 4; i++) {
         int y = 338 + i * 26;
-        SLabel(kNumFields[16 + i].label, 344, y + 3, 220, 18);
+        SLabel(NumLabel(typIds[i]), 344, y + 3, 220, 18);
         SEdit(typIds[i], 566, y, 50, 22, true, i == 0);   // (the first one ends the radio group)
     }
     SCheck(ID_S_PRIV_WARN, L"Show a warning when switching to Private Servers", 150, 452, 340, 20);   // centered
     g_pageList = NULL;
 
     // ======== buttons (always visible)
-    SButton(ID_S_DEFAULTS, L"LOAD DEFAULTS", 16, 480, 130, 28, false);
-    SButton(ID_S_FOLDER, L"OPEN SETTINGS FOLDER", 154, 480, 176, 28, false);
-    SButton(ID_S_SAVE, L"SAVE CONFIGURATION", 338, 480, 184, 28, true);
-    SButton(ID_S_CANCEL, L"CANCEL", 530, 480, 94, 28, false);
-    SMake(L"STATIC", (L"Settings file: " + g_iniPath).c_str(), SS_LEFT | SS_NOPREFIX | SS_PATHELLIPSIS, 0, 16, 520, 440, 16, -1);
-    SMake(L"STATIC", L"\u00A9 2026 Sparc343", SS_RIGHT | SS_NOPREFIX, 0, 464, 520, 160, 16, -1);
+    SButton(ID_S_DEFAULTS, L"LOAD DEFAULTS", 16, 490, 130, 28, false);
+    SButton(ID_S_FOLDER, L"OPEN SETTINGS FOLDER", 154, 490, 176, 28, false);
+    SButton(ID_S_SAVE, L"SAVE CONFIGURATION", 338, 490, 184, 28, true);
+    SButton(ID_S_CANCEL, L"CANCEL", 530, 490, 94, 28, false);
+    SMake(L"STATIC", (L"Settings file: " + g_iniPath).c_str(), SS_LEFT | SS_NOPREFIX | SS_PATHELLIPSIS, 0, 16, 530, 440, 16, -1);
+    SMake(L"STATIC", L"\u00A9 2026 Sparc343", SS_RIGHT | SS_NOPREFIX, 0, 464, 530, 160, 16, -1);
 
     // hover hints
     Tip(ID_S_PAGE_BASIC, L"The settings most people use.");
     Tip(ID_S_PAGE_ADV, L"Timing and fine-tuning. The defaults suit most computers.");
     Tip(ID_S_PAGE_PRIV, L"Settings for private servers (game servers that do not use Arc).");
+    Tip(ID_S_ADV_SUB_SHARED, L"Settings used by both Hidden Arc Mode and Show Arc Mode.");
+    Tip(ID_S_ADV_SUB_HIDDEN, L"Timing for Hidden Arc Mode (Arc's window is kept off-screen for the whole sign-in).");
+    Tip(ID_S_ADV_SUB_SHOW, L"Timing for Show Arc Mode (the old visible pop-up method).");
+    Tip(ID_S_MODE_HIDDEN, L"Hides Arc's window throughout the login process (it may flicker very briefly on your screen). The game's launcher / patcher window is hidden too.");
+    Tip(ID_S_MODE_SHOW, L"Shows Arc's window and uses the old pop-up/auto-fill method to sign in.");
+    Tip(ID_S_HL_KEYDELAY, L"Pause between a key going down and coming back up, and between key presses, while hidden.");
+    Tip(ID_S_HL_CHARDELAY, L"Pause between typed characters while hidden.");
+    Tip(ID_S_HL_POSTTAB, L"Pause after pressing Tab to move to the next box.");
+    Tip(ID_S_HL_POSTFIELD, L"Pause after finishing a box (username or password) before moving on.");
+    Tip(ID_S_HL_HIDESETTLE, L"Pause right after hiding the Sign In window, before typing starts.");
+    Tip(ID_S_HL_SIGNINTIMEOUT, L"Give up if Arc's Sign In window has not appeared after this many seconds.");
+    Tip(ID_S_HL_SIGNINPOLL, L"How often to check for the Sign In window while waiting for it.");
+    Tip(ID_S_HL_MAININITDELAY, L"After submitting the login, wait this long before looking for Arc's real main window (too soon can find an unfinished placeholder instead).");
+    Tip(ID_S_HL_MAINTIMEOUT, L"Give up if Arc's main window has not appeared after this many seconds.");
+    Tip(ID_S_HL_MAINPOLL, L"How often to check for Arc's main window while waiting for it.");
+    Tip(ID_S_HL_PATCHERTIMEOUT, L"Give up waiting for the game's launcher/patcher to start after this many seconds (Arc is closed either way once this ends).");
+    Tip(ID_S_HL_PATCHERPOLL, L"How often to check whether the launcher/patcher has started.");
+    Tip(ID_S_CLICKPLAY, L"Show Arc Mode only: once auto-fill submits your username and password, automatically click Arc's own Play button too, instead of clicking it yourself. Hidden Arc Mode always does this.");
+    Tip(ID_S_CLICKSTART, L"Show Arc Mode only: once the launcher/patcher shows up, automatically click its Start button so the game client opens on its own. Hidden Arc Mode always does this (its launcher/patcher window is hidden).");
+    Tip(ID_S_START_POLL, L"How often to click Start while waiting for the launcher/patcher to finish updating and launch the game. Applies to both Launcher Modes.");
+    Tip(ID_S_START_TIMEOUT, L"Give up clicking Start after this many seconds. Applies to both Launcher Modes.");
     Tip(ID_S_PRIV_PATH, L"The game client (elementclient.exe) or the launcher / patcher of the private server. It is started with administrator rights.");
     Tip(ID_S_PRIV_FLAGS, L"Command-line flags, passed exactly as typed. Never put your password here.");
     Tip(ID_S_PRIV_WARN, L"Show a warning every time you switch the main window to Private Servers.");
@@ -2640,10 +3395,6 @@ static void BuildSettingsWindow() {
     Tip(ID_S_LOGINMS, L"How long Arc's login window must be showing before typing starts (1000 = 1 second).");
     Tip(ID_S_MINWAIT, L"Never type sooner than this after starting Arc (skips update pop-ups).");
     Tip(ID_S_WINTIMEOUT, L"Give up looking for Arc's login window after this many seconds.");
-    Tip(ID_S_CLOSE_LAUNCHER, L"Close this Arc as soon as it starts the game launcher (launcher.exe).");
-    Tip(ID_S_CLOSE_GAME, L"Wait until the game client (elementclient.exe) is running before closing Arc.");
-    Tip(ID_S_LGRACE, L"Seconds to wait after the launcher appears before closing Arc.");
-    Tip(ID_S_GRACE, L"Seconds to wait after the game client appears before closing Arc.");
     Tip(ID_S_TIMEOUT, L"Give up waiting for a game client after this many seconds.");
     Tip(ID_S_PENDING, L"After Arc has been closed early, how long to keep watching for its game client.");
     Tip(ID_S_CONFIRM, L"Ask for confirmation before the STOP button force-closes a game client.");
@@ -2656,6 +3407,7 @@ static void BuildSettingsWindow() {
     Tip(ID_S_BG, L"Your own picture (png, jpg, bmp or gif). Leave empty to use a background.* file next to the program, or the built-in image.");
     Tip(ID_S_DIM, L"0% = picture as it is, 100% = black. Darker keeps the text easier to read.");
     Tip(ID_S_DEFAULTS, L"Fill in the standard values. Nothing is saved until you press SAVE CONFIGURATION.");
+    ShowAdvSub(0);
     ShowSettingsPage(0);
 }
 
@@ -2682,7 +3434,10 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
             SettingsToUi(d);
             g_setDirty = true;
         }
-        else if ((id == ID_S_PAGE_BASIC || id == ID_S_PAGE_ADV || id == ID_S_PAGE_PRIV) && note == BN_CLICKED) ShowSettingsPage(id == ID_S_PAGE_PRIV ? 2 : (id == ID_S_PAGE_ADV ? 1 : 0));
+        else if ((id == ID_S_PAGE_BASIC || id == ID_S_PAGE_ADV || id == ID_S_PAGE_PRIV) && note == BN_CLICKED)
+            ShowSettingsPage(id == ID_S_PAGE_PRIV ? 2 : (id == ID_S_PAGE_ADV ? 1 : 0));
+        else if ((id == ID_S_ADV_SUB_SHARED || id == ID_S_ADV_SUB_HIDDEN || id == ID_S_ADV_SUB_SHOW) && note == BN_CLICKED)
+            ShowAdvSub(id == ID_S_ADV_SUB_SHOW ? 2 : (id == ID_S_ADV_SUB_HIDDEN ? 1 : 0));
         else if (id == ID_S_FOLDER && note == BN_CLICKED) ShellExecuteW(hwnd, L"open", g_configDir.c_str(), NULL, NULL, SW_SHOWNORMAL);
         else if (id == ID_S_PRIV_PATHBROWSE && note == BN_CLICKED) BrowseInto(ID_S_PRIV_PATH, L"Programs (*.exe)\0*.exe\0All files\0*.*\0", L"Locate the game client or launcher");
         else if (id == ID_S_ARCBROWSE && note == BN_CLICKED) BrowseInto(ID_S_ARC, L"Arc.exe\0Arc.exe\0All files\0*.*\0", L"Locate Arc.exe");
@@ -2710,7 +3465,7 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
 static void OpenSettings() {
     if (g_setWnd) { SetForegroundWindow(g_setWnd); return; }
     DWORD style = WS_CAPTION | WS_SYSMENU, ex = WS_EX_CONTROLPARENT;
-    RECT rc = { 0, 0, 640, 548 };
+    RECT rc = { 0, 0, 640, 558 };
     AdjustWindowRectEx(&rc, style, FALSE, ex);
     int w = rc.right - rc.left, h = rc.bottom - rc.top;
     RECT mr, wa = { 0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN) };
@@ -2782,8 +3537,7 @@ static std::wstring BuildLogReport() {
     r += L"Settings: ";
     r += KV(L"AutoFill", S.autoFill) + KV(L"UsernameFocusTabs", S.usernameFocusTabs) + KV(L"FieldSeparatorTabs", S.fieldSeparatorTabs) +
          KV(L"LoginDelayMs", S.loginDelayMs) + KV(L"MinWaitSeconds", S.minWaitSeconds) + KV(L"WindowTimeoutSeconds", S.windowTimeoutSeconds);
-    r += std::wstring(L"CloseArcAt=") + (S.closeAtLauncher ? L"launcher" : L"game") + L"  ";
-    r += KV(L"LauncherGraceSeconds", S.launcherGraceSeconds) + KV(L"GraceSeconds", S.graceSeconds) + KV(L"TimeoutSeconds", S.timeoutSeconds) +
+    r += KV(L"TimeoutSeconds", S.timeoutSeconds) +
          KV(L"PendingTimeoutSeconds", S.pendingTimeoutSeconds) + KV(L"KillArcOnStart", S.killArcOnStart) + KV(L"RenameGameWindows", S.renameWindows) +
          KV(L"RenameDurationSeconds", S.renameDurationSeconds) + KV(L"StatusResetSeconds", S.statusResetSeconds);
     r += L"\r\n(showing: " + std::wstring(LogViewingPrevious() ? L"previous run" : L"current run") + L")\r\n";
@@ -2928,9 +3682,8 @@ static void UpdateDeleteButtons() {
             if (!ok && g_rows[i].selected) g_rows[i].selected = false;
             InvalidateRect(g_rows[i].del, NULL, FALSE);
         }
-        bool upOk = g_active.row < 0 && i > 0, downOk = g_active.row < 0 && i + 1 < g_rows.size();   // moving rows is only blocked while a sign-in runs
-        if ((IsWindowEnabled(g_rows[i].up) != FALSE) != upOk) { EnableWindow(g_rows[i].up, upOk); InvalidateRect(g_rows[i].up, NULL, FALSE); }
-        if ((IsWindowEnabled(g_rows[i].down) != FALSE) != downOk) { EnableWindow(g_rows[i].down, downOk); InvalidateRect(g_rows[i].down, NULL, FALSE); }
+        bool gripOk = g_active.row < 0 && g_rows.size() > 1;   // moving rows is only blocked while a sign-in runs (or when there is just one row)
+        if ((IsWindowEnabled(g_rows[i].grip) != FALSE) != gripOk) { EnableWindow(g_rows[i].grip, gripOk); InvalidateRect(g_rows[i].grip, NULL, FALSE); }
     }
     UpdateSelectionHint();
 }
@@ -2944,8 +3697,7 @@ static void RenumberRow(int k) {
     SetWindowLongPtrW(r.stop, GWLP_ID, RowId(k, K_STOP));
     SetWindowLongPtrW(r.status, GWLP_ID, RowId(k, K_STATUS));
     SetWindowLongPtrW(r.del, GWLP_ID, RowId(k, K_DEL));
-    SetWindowLongPtrW(r.up, GWLP_ID, RowId(k, K_UP));
-    SetWindowLongPtrW(r.down, GWLP_ID, RowId(k, K_DOWN));
+    SetWindowLongPtrW(r.grip, GWLP_ID, RowId(k, K_GRIP));
 }
 static void RemoveRow(int i) {
     Row& r = g_rows[i];
@@ -2958,10 +3710,9 @@ static void RemoveRow(int i) {
     DestroyWindow(r.stop);
     DestroyWindow(r.status);
     DestroyWindow(r.del);
-    DelTip(g_tipMain, g_hwnd, r.up);
-    DelTip(g_tipMain, g_hwnd, r.down);
-    DestroyWindow(r.up);
-    DestroyWindow(r.down);
+    DelTip(g_tipMain, g_hwnd, r.grip);
+    if (g_hotDel == r.grip) g_hotDel = NULL;
+    DestroyWindow(r.grip);
     g_rows.erase(g_rows.begin() + i);
     for (size_t k = (size_t)i; k < g_rows.size(); k++) RenumberRow((int)k);
 }
@@ -2977,23 +3728,27 @@ static std::wstring RowLabel(int i) {
     if (u.empty()) u = L"(no username)";
     return n.empty() ? u : u + L"  (" + n + L")";
 }
-// moves a row up (dir = -1) or down (dir = +1); the whole row (texts, running client, status) moves with it
-static void MoveRow(int i, int dir) {
-    int j = i + dir;
-    if (i < 0 || j < 0 || i >= (int)g_rows.size() || j >= (int)g_rows.size()) return;
+// moves a row from place 'from' to place 'to' (any distance); the whole row (texts, running client, status) moves with it
+static void MoveRowTo(int from, int to) {
+    int n = (int)g_rows.size();
+    if (from < 0 || to < 0 || from >= n || to >= n || from == to) return;
     if (g_active.row >= 0) { Msg(L"A sign-in is in progress. Wait for it to finish, or cancel it first.", L"Cannot move now"); return; }
-    std::swap(g_rows[i], g_rows[j]);
-    RenumberRow(i);
-    RenumberRow(j);
+    Row moved = g_rows[from];
+    g_rows.erase(g_rows.begin() + from);
+    g_rows.insert(g_rows.begin() + to, moved);
+    for (int k = std::min(from, to); k <= std::max(from, to); k++) RenumberRow(k);
     RelayoutRows();
     for (size_t k = 0; k < g_rows.size(); k++) {   // keep the Tab order the same as the order on screen
         HWND order[5] = { g_rows[k].user, g_rows[k].pass, g_rows[k].notes, g_rows[k].sign, g_rows[k].stop };
-        for (int n = 0; n < 5; n++) SetWindowPos(order[n], HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        for (int q = 0; q < 5; q++) SetWindowPos(order[q], HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     }
     SaveAccounts();   // the new order is saved right away
     SaveSession();
     UpdateDeleteButtons();
+    EnsureRowVisible(to);
 }
+// moves a row one place up (dir = -1) or down (dir = +1), used by ALT+UP / ALT+DOWN
+static void MoveRow(int i, int dir) { MoveRowTo(i, i + dir); }
 static void DeleteClick(int i) {
     if (i < 0 || i >= (int)g_rows.size()) return;
     bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0, ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
@@ -3045,11 +3800,9 @@ static void ClearRows() {
         DestroyWindow(g_rows[i].stop);
         DestroyWindow(g_rows[i].status);
         DelTip(g_tipMain, g_hwnd, g_rows[i].del);
-        DelTip(g_tipMain, g_hwnd, g_rows[i].up);
-        DelTip(g_tipMain, g_hwnd, g_rows[i].down);
+        DelTip(g_tipMain, g_hwnd, g_rows[i].grip);
         DestroyWindow(g_rows[i].del);
-        DestroyWindow(g_rows[i].up);
-        DestroyWindow(g_rows[i].down);
+        DestroyWindow(g_rows[i].grip);
     }
     g_hotDel = NULL;
     g_rows.clear();
@@ -3211,8 +3964,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_tipMain = MakeTooltips(hwnd);
         for (size_t i = 0; i < g_rows.size(); i++) {
             AddTip(g_tipMain, hwnd, g_rows[i].del, kDelTip);
-            AddTip(g_tipMain, hwnd, g_rows[i].up, L"Move this account up");
-            AddTip(g_tipMain, hwnd, g_rows[i].down, L"Move this account down");
+            AddTip(g_tipMain, hwnd, g_rows[i].grip, kGripTip);
         }
         AddTip(g_tipMain, hwnd, g_btnMode, L"OFFICIAL Servers = the game through Arc. PRIVATE Servers = private servers (no Arc). Each mode has its own account list. Click to switch.");
         AddTip(g_tipMain, hwnd, g_btnImport, L"Add accounts from a text file (same format as accounts.txt). Accounts already in the list are skipped.");
@@ -3225,6 +3977,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         AdoptSession();
         UpdateModeUi();
         SetTimer(hwnd, ID_TIMER, 1000, NULL);
+        SetTimer(hwnd, ID_TOOLHIDE, 100, NULL);
         SetTimer(hwnd, ID_MARQUEE, 50, NULL);
         return 0;
     }
@@ -3253,9 +4006,42 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_TIMER:
         if (wp == ID_TIMER) UpdateState();
         else if (wp == ID_PRIVTIMER) PrivateTick();
+        else if (wp == ID_TOOLHIDE) HideLaunchToolWindows();
         else if (wp == ID_MARQUEE) { if (g_hintScrolls && g_lblStorage && IsWindowVisible(g_lblStorage)) InvalidateRect(g_lblStorage, NULL, FALSE); }
         else if (wp == ID_BGTIMER) { KillTimer(hwnd, ID_BGTIMER); RenderBackground(false); }
         return 0;
+    case WM_HIDDENLOGIN_DONE: {
+        int row = (int)wp;
+        HiddenLoginResult res = (HiddenLoginResult)(int)lp;
+        if (g_hiddenThread.joinable()) g_hiddenThread.join();
+        CloseHiddenLoginPopup();
+        if (row >= 0 && row < (int)g_rows.size() && g_active.row == row && g_active.phase == PH_HIDDEN) {
+            Active a = g_active;   // FinishActive() below clears g_active; keep a copy of what we need first
+            Row& r = g_rows[row];
+            if (res == HiddenLoginResult::Success) {
+                r.pending = true;
+                r.pendingSince = GetTickCount();
+                r.pendingBase = a.gameBase;
+                r.pendingLaunchBase = a.launchBase;
+                r.lastStartClickAt = 0;
+                r.hideTools = true;   // Hidden Arc Mode: keep the launcher/patcher off-screen too
+                r.startSawTool = false; r.startToolFirstSeenAt = 0;
+                FinishActive(L"Launcher started - waiting for the game client (CANCEL to stop)", cWhite);
+                SetSignText(row, L"CANCEL");
+            } else if (res == HiddenLoginResult::Cancelled) {
+                FinishActive(L"Cancelled - Arc was closed", cGray, true);
+            } else if (res == HiddenLoginResult::ArcLaunchFailed) {
+                FinishActive(L"Could not start Arc.exe", cAmber, true);
+            } else if (res == HiddenLoginResult::SignInWindowNotFound) {
+                FinishActive(L"Timed out waiting for Arc's Sign In window", cAmber, true);
+            } else if (res == HiddenLoginResult::MainWindowNotFound) {
+                FinishActive(L"Signed in, but Arc's main window never appeared", cAmber, true);
+            } else {   // PatcherNotDetected
+                FinishActive(L"Signed in, but the launcher/patcher never started", cAmber, true);
+            }
+        }
+        return 0;
+    }
     case WM_COMMAND: {
         int id = LOWORD(wp), note = HIWORD(wp);
         if (id == ID_ADD && note == BN_CLICKED) {
@@ -3287,8 +4073,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 if (kind == K_SIGN) StartPlay(row);
                 else if (kind == K_STOP) StopClient(row);
                 else if (kind == K_DEL) DeleteClick(row);
-                else if (kind == K_UP) MoveRow(row, -1);
-                else if (kind == K_DOWN) MoveRow(row, 1);
             }
         }
         return 0;
@@ -3317,6 +4101,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 if (MessageBoxW(hwnd, q.c_str(), L"Game clients running", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES) return 0;
             }
         }
+        if (g_active.row >= 0 && g_active.phase == PH_HIDDEN) {
+            // let the hidden-login thread finish cleanly (it kills Arc itself) instead of leaving it running after the window is gone
+            g_hiddenCancel = true;
+            if (g_hiddenThread.joinable()) g_hiddenThread.join();
+            CloseHiddenLoginPopup();
+            g_active.row = -1;
+            g_active.phase = PH_NONE;
+        }
         SaveAccounts();
         SaveSession();
         if (S.rememberSize && !IsIconic(hwnd) && !IsZoomed(hwnd)) {
@@ -3332,6 +4124,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_DESTROY:
         KillTimer(hwnd, ID_TIMER);
+        KillTimer(hwnd, ID_TOOLHIDE);
         KillTimer(hwnd, ID_BGTIMER);
         PostQuitMessage(0);
         return 0;
@@ -3378,6 +4171,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
     g_font = CreateFontW(-13, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH, L"Segoe UI");
     g_fontBold = CreateFontW(-13, 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH, L"Segoe UI");
     g_fontTitle = CreateFontW(-27, 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+    g_fontHiddenPopup = CreateFontW(-19, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH, L"Segoe UI");   // ~14pt, matches the PowerShell version's popup text size
     LoadBackgroundSource();
 
     WNDCLASSEXW pc;
@@ -3419,6 +4213,18 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
     lc.lpszClassName = L"ArcManagerLog";
     RegisterClassExW(&lc);
 
+    WNDCLASSEXW hpc;
+    ZeroMemory(&hpc, sizeof(hpc));
+    hpc.cbSize = sizeof(hpc);
+    hpc.lpfnWndProc = StatusPopupProc;
+    hpc.hInstance = hInst;
+    hpc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    hpc.hIcon = wc.hIcon;
+    hpc.hIconSm = wc.hIconSm;
+    hpc.hbrBackground = g_brBg;
+    hpc.lpszClassName = L"ArcManagerHiddenPopup";
+    RegisterClassExW(&hpc);
+
     DWORD style = WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN;
     DWORD exstyle = WS_EX_CONTROLPARENT;
     RECT rc = { 0, 0, S.windowWidth, S.windowHeight };
@@ -3449,8 +4255,14 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
             if (m.message == WM_KEYDOWN && m.wParam == VK_ESCAPE) { PostMessageW(g_logWnd, WM_CLOSE, 0, 0); continue; }
             if (IsDialogMessageW(g_logWnd, &m)) continue;
         }
+        if (g_drag.active && m.message == WM_KEYDOWN && m.wParam == VK_ESCAPE) { EndDrag(); continue; }   // ESC cancels a drag
         if (!g_setWnd && !g_logWnd && (m.hwnd == hwnd || IsChild(hwnd, m.hwnd))) {
             if (m.message == WM_SYSKEYDOWN && m.wParam == 'D') { DeleteSelected(); continue; }   // ALT+D
+            if (m.message == WM_SYSKEYDOWN && (m.wParam == VK_UP || m.wParam == VK_DOWN) && !g_drag.active) {   // ALT+UP / ALT+DOWN: move the row that has the cursor
+                int id = GetDlgCtrlID(m.hwnd);
+                if (id >= ID_ROW_BASE && (id - ID_ROW_BASE) / 10 < (int)g_rows.size()) MoveRow((id - ID_ROW_BASE) / 10, m.wParam == VK_UP ? -1 : 1);
+                continue;
+            }
             if (m.message == WM_KEYDOWN && m.wParam == VK_ESCAPE && SelectedCount() > 0) { ClearSelection(); continue; }
         }
         if (!IsDialogMessageW(hwnd, &m)) {

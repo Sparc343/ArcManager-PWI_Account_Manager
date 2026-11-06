@@ -3,7 +3,7 @@
 #
 # Flow per row: SIGN IN -> starts a fresh Arc.exe -> types the username and password into
 #   Arc's login window and presses Enter -> YOU click Play in Arc -> manager sees Arc start
-#   launcher.exe (or the game client, see $CloseArcAt) -> closes that Arc after a short delay.
+#   launcher.exe -> closes that Arc right away.
 #
 # Accounts are saved in PLAIN TEXT in %AppData%\ArcManager\accounts.txt (username<TAB>password).
 
@@ -12,7 +12,7 @@
 # Change them with the gear button in the program. To edit the file by hand, save it and restart the program.
 # A copy of ArcManager.ini placed next to this script is used instead of that one (portable mode).
 # Program version, shown in the log and in the settings window. >>> Change it here when you release a new version. <<<
-$AppVersion = 'v2.NOV.2026'
+$AppVersion = 'v6.NOV.2026'
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ScriptPath = $MyInvocation.MyCommand.Path
 $ConfigDir = Join-Path $env:APPDATA 'ArcManager'
@@ -60,6 +60,7 @@ Add-Type -AssemblyName Microsoft.VisualBasic
 Add-Type -TypeDefinition @'
 using System;
 using System.Text;
+using System.Collections.Generic;
 using System.Runtime.InteropServices;
 public class WinHelper {
     public delegate bool EnumProc(IntPtr h, IntPtr l);
@@ -69,12 +70,27 @@ public class WinHelper {
     [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
     [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
     [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr h, out RECT r);
+    [DllImport("user32.dll")] static extern bool GetClientRect(IntPtr h, out RECT r);
+    [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr h, IntPtr hAfter, int x, int y, int cx, int cy, uint flags);
     [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int cmd);
     [DllImport("user32.dll", CharSet = CharSet.Auto)] static extern int GetWindowText(IntPtr h, StringBuilder sb, int max);
     [DllImport("user32.dll", CharSet = CharSet.Auto)] static extern int GetClassName(IntPtr h, StringBuilder sb, int max);
 
+    // Hidden Arc Mode: moves every top-level window of the given processes off-screen (moved, not hidden or minimized, so it
+    // still counts as visible and keeps its real size for the Start click). Windows that are already off-screen are skipped.
+    public static void MoveOffScreen(int[] pids) {
+        EnumWindows(delegate(IntPtr h, IntPtr l) {
+            uint pid;
+            GetWindowThreadProcessId(h, out pid);
+            if (Array.IndexOf(pids, (int)pid) < 0) return true;
+            RECT r;
+            if (GetWindowRect(h, out r) && r.L <= -30000) return true;
+            SetWindowPos(h, IntPtr.Zero, -32000, -32000, 0, 0, 0x0001 | 0x0004 | 0x0010);   // SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE
+            return true;
+        }, IntPtr.Zero);
+    }
     // largest visible top-level window belonging to any of the given process ids
     public static IntPtr FindVisibleWindow(int[] pids) {
         IntPtr best = IntPtr.Zero;
@@ -95,6 +111,14 @@ public class WinHelper {
         }, IntPtr.Zero);
         return best;
     }
+    // the launcher/patcher window briefly exists at an undersized / not-yet-laid-out size right after it is created
+    // (the same kind of early-placeholder issue Arc's own main window had); only once its client area looks like
+    // the real, fully loaded window should it be clicked (Start was confirmed at (853, 557) on a 984 x 744 client).
+    public static bool ClientAtLeast(IntPtr h, int minW, int minH) {
+        RECT r;
+        if (!GetClientRect(h, out r)) return false;
+        return (r.R - r.L) >= minW && (r.B - r.T) >= minH;
+    }
     // text description of every top-level window of the given processes (for the debug log)
     public static string DescribeWindows(int[] pids) {
         StringBuilder sb = new StringBuilder();
@@ -113,6 +137,9 @@ public class WinHelper {
         }, IntPtr.Zero);
         return sb.ToString();
     }
+    [DllImport("user32.dll")] static extern bool RedrawWindow(IntPtr h, IntPtr rect, IntPtr rgn, uint flags);
+    // paints a window and all its children right now (INVALIDATE | ERASE | ALLCHILDREN | UPDATENOW): used while a dragged row scrolls the list
+    public static void RedrawNow(IntPtr h) { RedrawWindow(h, IntPtr.Zero, IntPtr.Zero, 0x0001u | 0x0004u | 0x0080u | 0x0100u); }
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern IntPtr SendMessage(IntPtr h, int msg, IntPtr wp, string lp);
     // grey placeholder text inside an empty text box (EM_SETCUEBANNER)
     public static void SetCue(IntPtr h, string text) { SendMessage(h, 0x1501, (IntPtr)1, text); }
@@ -181,6 +208,273 @@ public class WinTitle {
         return found + ";" + renamed + ";" + cls;
     }
 }
+// ---- Hidden Login: runs the REAL, official Arc sign-in flow (launch, type credentials, click Play) while
+// every Arc window stays hidden. This never bypasses Arc's own authentication - it only keeps Arc's own
+// windows off-screen while Arc does its normal, legitimate sign-in. The whole thing runs on its own
+// background thread so PowerShell 2's GUI thread is never blocked; the GUI side polls HiddenLoginState.
+public class HiddenLoginSettings {
+    public string ArcPath;
+    public string Username;
+    public string Password;
+    public int KeyDelayMs;
+    public int CharDelayMs;
+    public int PostTabDelayMs;
+    public int PostFieldDelayMs;
+    public int HideSettleDelayMs;
+    public int SignInTimeoutSec;
+    public int SignInPollIntervalMs;
+    public int MainWindowInitialDelayMs;
+    public int MainWindowTimeoutSec;
+    public int MainWindowPollIntervalMs;
+    public int PatcherWaitTimeoutSec;
+    public int PatcherWaitPollIntervalMs;
+    public bool ClickPatcherStart;
+    public int PatcherStartPollIntervalMs;
+    public int PatcherStartTimeoutSec;
+}
+// Cross-thread status, polled (never pushed) from the GUI's 1-second timer tick - the safe pattern on PS2,
+// where a background .NET thread cannot reliably call back into a PowerShell script block.
+public class HiddenLoginState {
+    public volatile bool Cancel;
+    public volatile bool Done;
+    public volatile int Result;   // 0=Success 1=ArcLaunchFailed 2=SignInWindowNotFound 3=MainWindowNotFound 4=Cancelled
+}
+public class HiddenLogin {
+    public delegate bool EnumProc(IntPtr h, IntPtr l);
+    [StructLayout(LayoutKind.Sequential)]
+    public struct RECT { public int L, T, R, B; }
+
+    [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc p, IntPtr l);
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+    [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr h, out RECT r);
+    [DllImport("user32.dll", CharSet = CharSet.Auto)] static extern int GetWindowText(IntPtr h, StringBuilder sb, int max);
+    [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr h, int cmd);
+    [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr h, IntPtr hAfter, int x, int y, int cx, int cy, uint flags);
+    [DllImport("user32.dll")] static extern IntPtr PostMessage(IntPtr h, uint msg, UIntPtr wp, IntPtr lp);
+
+    const uint WM_KEYDOWN = 0x0100, WM_KEYUP = 0x0101, WM_CHAR = 0x0102;
+    const uint WM_MOUSEMOVE = 0x0200, WM_LBUTTONDOWN = 0x0201, WM_LBUTTONUP = 0x0202;
+    const int SW_HIDE = 0;
+    const uint SWP_NOSIZE = 0x0001, SWP_NOZORDER = 0x0004, SWP_NOACTIVATE = 0x0010;
+    const int VK_TAB = 0x09, VK_RETURN = 0x0D, VK_END = 0x23, VK_BACK = 0x08;
+
+    static volatile bool hiderRunning;
+    static volatile bool hiderPaused;
+
+    static List<IntPtr> FindArcWindows() {
+        List<IntPtr> list = new List<IntPtr>();
+        List<int> pids = new List<int>();
+        foreach (System.Diagnostics.Process p in System.Diagnostics.Process.GetProcessesByName("Arc")) pids.Add(p.Id);
+        if (pids.Count == 0) return list;
+        EnumWindows(delegate(IntPtr h, IntPtr l) {
+            uint pid;
+            GetWindowThreadProcessId(h, out pid);
+            if (pids.Contains((int)pid)) list.Add(h);
+            return true;
+        }, IntPtr.Zero);
+        return list;
+    }
+    static string GetTitle(IntPtr h) {
+        StringBuilder sb = new StringBuilder(256);
+        GetWindowText(h, sb, 256);
+        return sb.ToString();
+    }
+    static IntPtr FindWindowByTitle(string title) {
+        foreach (IntPtr h in FindArcWindows()) if (GetTitle(h) == title) return h;
+        return IntPtr.Zero;
+    }
+    // the largest window titled exactly "Arc" (its real main window), at least 800x500
+    static IntPtr FindLargestArcWindow() {
+        IntPtr best = IntPtr.Zero;
+        int bestArea = 0;
+        foreach (IntPtr h in FindArcWindows()) {
+            if (GetTitle(h) != "Arc") continue;
+            RECT r;
+            GetWindowRect(h, out r);
+            int w = r.R - r.L, ht = r.B - r.T;
+            if (w < 800 || ht < 500) continue;
+            int area = w * ht;
+            if (area > bestArea) { bestArea = area; best = h; }
+        }
+        return best;
+    }
+    static void HideAllArcWindows() {
+        foreach (IntPtr h in FindArcWindows()) {
+            ShowWindow(h, SW_HIDE);
+            SetWindowPos(h, IntPtr.Zero, -32000, -32000, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+    }
+    static void KillAllArc() {
+        foreach (System.Diagnostics.Process p in System.Diagnostics.Process.GetProcessesByName("Arc")) {
+            try { p.Kill(); } catch { }
+        }
+    }
+    static void SendKeyPress(IntPtr h, int vk, int delayMs) {
+        PostMessage(h, WM_KEYDOWN, (UIntPtr)(uint)vk, IntPtr.Zero);
+        System.Threading.Thread.Sleep(delayMs);
+        PostMessage(h, WM_KEYUP, (UIntPtr)(uint)vk, IntPtr.Zero);
+    }
+    static void SendCharText(IntPtr h, string text, int delayMs) {
+        if (text == null) return;
+        foreach (char c in text) {
+            PostMessage(h, WM_CHAR, (UIntPtr)(uint)c, IntPtr.Zero);
+            System.Threading.Thread.Sleep(delayMs);
+        }
+    }
+    static void ClearTextField(IntPtr h, int delayMs) {
+        SendKeyPress(h, VK_END, delayMs);
+        for (int i = 0; i < 40; i++) SendKeyPress(h, VK_BACK, delayMs);
+    }
+    static void SendClickAt(IntPtr h, int x, int y) {
+        IntPtr lp = (IntPtr)(((y & 0xFFFF) << 16) | (x & 0xFFFF));
+        PostMessage(h, WM_MOUSEMOVE, UIntPtr.Zero, lp);
+        PostMessage(h, WM_LBUTTONDOWN, (UIntPtr)1, lp);
+        System.Threading.Thread.Sleep(30);
+        PostMessage(h, WM_LBUTTONUP, UIntPtr.Zero, lp);
+    }
+    static void Log(string msg) {
+        try {
+            string dir = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData) + "\\ArcManager";
+            if (!System.IO.Directory.Exists(dir)) System.IO.Directory.CreateDirectory(dir);
+            System.IO.File.AppendAllText(dir + "\\hidden_debug.log", DateTime.Now.ToString("HH:mm:ss.fff") + "  " + msg + "\r\n");
+        } catch { }
+    }
+    static void HiderLoop() {
+        while (hiderRunning) {
+            if (!hiderPaused) HideAllArcWindows();
+            System.Threading.Thread.Sleep(1000);   // a tight loop fights Arc for its own message queue; once a second is plenty
+        }
+    }
+    // spawns the background thread and returns immediately; state is polled by the GUI thread afterwards
+    public static void Start(HiddenLoginSettings settings, HiddenLoginState state) {
+        System.Threading.Thread t = new System.Threading.Thread(delegate() { Run(settings, state); });
+        t.IsBackground = true;
+        t.Start();
+    }
+    // exposes the message-based click used throughout this class, for Show Arc Mode's GUI-thread auto-click-Start loop
+    public static void ClickAt(IntPtr h, int x, int y) { SendClickAt(h, x, y); }
+    // exposes the "real main/library window" finder for Show Arc Mode's GUI-thread auto-click-Play phase (ClickArcPlay)
+    public static IntPtr FindArcMainWindow() { return FindLargestArcWindow(); }
+    // Result codes (match the C++ HiddenLoginResult enum exactly): 0=Success 1=ArcLaunchFailed 2=SignInWindowNotFound
+    // 3=MainWindowNotFound 4=PatcherNotDetected 5=Cancelled
+    static void Run(HiddenLoginSettings s, HiddenLoginState state) {
+        try {
+            KillAllArc();   // always start clean: Arc cannot be launched again while an instance of it is already running
+            System.Threading.Thread.Sleep(500);
+
+            hiderRunning = true;
+            hiderPaused = false;
+            System.Threading.Thread hider = new System.Threading.Thread(new System.Threading.ThreadStart(HiderLoop));
+            hider.IsBackground = true;
+            hider.Start();
+            System.Threading.Thread.Sleep(50);
+
+            if (state.Cancel) { hiderRunning = false; KillAllArc(); state.Result = 5; state.Done = true; return; }
+
+            try {
+                System.Diagnostics.ProcessStartInfo psi = new System.Diagnostics.ProcessStartInfo(s.ArcPath);
+                psi.WorkingDirectory = System.IO.Path.GetDirectoryName(s.ArcPath);
+                System.Diagnostics.Process.Start(psi);
+            } catch (Exception ex) {
+                Log("ArcLaunchFailed: " + ex.Message);
+                hiderRunning = false;
+                state.Result = 1; state.Done = true;
+                return;
+            }
+            Log("hidden login: started Arc.exe (invisibly)");
+
+            IntPtr signIn = IntPtr.Zero;
+            int waited = 0;
+            int timeoutMs = s.SignInTimeoutSec * 1000;
+            while (waited < timeoutMs) {
+                signIn = FindWindowByTitle("Sign In");
+                if (signIn != IntPtr.Zero || state.Cancel) break;
+                System.Threading.Thread.Sleep(s.SignInPollIntervalMs);
+                waited += s.SignInPollIntervalMs;
+            }
+            if (state.Cancel) { hiderRunning = false; KillAllArc(); state.Result = 5; state.Done = true; return; }
+            if (signIn == IntPtr.Zero) {
+                Log("hidden login: the Sign In window never appeared");
+                hiderRunning = false; KillAllArc();
+                state.Result = 2; state.Done = true;
+                return;
+            }
+
+            hiderPaused = true;
+            ShowWindow(signIn, SW_HIDE);
+            System.Threading.Thread.Sleep(s.HideSettleDelayMs);
+
+            SendKeyPress(signIn, VK_TAB, s.KeyDelayMs);
+            System.Threading.Thread.Sleep(s.PostTabDelayMs);
+            ClearTextField(signIn, s.KeyDelayMs);
+            SendCharText(signIn, s.Username, s.CharDelayMs);
+            System.Threading.Thread.Sleep(s.PostFieldDelayMs);
+
+            SendKeyPress(signIn, VK_TAB, s.KeyDelayMs);
+            System.Threading.Thread.Sleep(s.PostTabDelayMs);
+            ClearTextField(signIn, s.KeyDelayMs);
+            SendCharText(signIn, s.Password, s.CharDelayMs);
+            System.Threading.Thread.Sleep(s.PostFieldDelayMs);
+
+            SendKeyPress(signIn, VK_RETURN, s.KeyDelayMs);
+            Log("hidden login: submitted username and password (hidden)");
+            hiderPaused = false;
+
+            if (state.Cancel) { hiderRunning = false; KillAllArc(); state.Result = 5; state.Done = true; return; }
+            System.Threading.Thread.Sleep(s.MainWindowInitialDelayMs);   // the real window needs a moment to exist; too soon finds an unfinished placeholder instead
+
+            IntPtr main = IntPtr.Zero;
+            waited = 0;
+            timeoutMs = s.MainWindowTimeoutSec * 1000;
+            while (waited < timeoutMs) {
+                main = FindLargestArcWindow();
+                if (main != IntPtr.Zero || state.Cancel) break;
+                System.Threading.Thread.Sleep(s.MainWindowPollIntervalMs);
+                waited += s.MainWindowPollIntervalMs;
+            }
+            if (state.Cancel) { hiderRunning = false; KillAllArc(); state.Result = 5; state.Done = true; return; }
+            if (main == IntPtr.Zero) {
+                Log("hidden login: signed in, but Arc's main window never appeared");
+                hiderRunning = false; KillAllArc();
+                state.Result = 3; state.Done = true;
+                return;
+            }
+
+            SendClickAt(main, 288, 405);   // Arc's Play button (confirmed coordinate); Arc is killed right after this anyway
+            Log("hidden login: clicked Play");
+            System.Threading.Thread.Sleep(500);
+            hiderRunning = false;
+
+            // waits for the real launch to begin, then ALWAYS kills Arc - patcher seen, not seen, or cancelled makes no
+            // difference (this is the step that was missing before: Arc used to just sit there after Play was clicked)
+            bool patcherSeen = false;
+            int pwaited = 0;
+            int ptimeout = s.PatcherWaitTimeoutSec * 1000;
+            while (pwaited < ptimeout) {
+                if (System.Diagnostics.Process.GetProcessesByName("launcher").Length > 0 ||
+                    System.Diagnostics.Process.GetProcessesByName("patcher").Length > 0) { patcherSeen = true; break; }
+                if (state.Cancel) break;
+                System.Threading.Thread.Sleep(s.PatcherWaitPollIntervalMs);
+                pwaited += s.PatcherWaitPollIntervalMs;
+            }
+            bool cancelledHere = !patcherSeen && state.Cancel;
+            KillAllArc();   // ALWAYS kill Arc at the end
+            if (cancelledHere) { state.Result = 5; state.Done = true; return; }
+            Log(patcherSeen ? "hidden login: launcher/patcher detected - done" : "hidden login: the launcher/patcher never appeared");
+            // returns right away so the "Obtaining ARC / PWI TOKEN Now" popup closes the instant the launcher/patcher
+            // is detected; auto-clicking Start (if on) is handled afterwards by the same tick-based logic Show Arc
+            // Mode uses (see Update-State), with its own "Starting Game" popup - the same behavior either way
+            state.Result = patcherSeen ? 0 : 4;
+            state.Done = true;
+        } catch (Exception ex) {
+            Log("unexpected error: " + ex);
+            hiderRunning = false;
+            try { KillAllArc(); } catch { }
+            state.Result = 3;
+            state.Done = true;
+        }
+    }
+}
 '@
 
 $AccountsFile = Join-Path $ConfigDir 'accounts.txt'
@@ -217,10 +511,6 @@ PauseAfterPopupMs=1500
 ; Backspaces pressed before typing a box, to remove old text (0 = none), and whether Enter is pressed after the password (1 = yes)
 ClearBackspaces=0
 EnterAfterPassword=1
-; CloseArcAt: launcher (as soon as Arc starts launcher.exe) or game (wait for elementclient.exe)
-CloseArcAt=launcher
-LauncherGraceSeconds=2
-GraceSeconds=6
 TimeoutSeconds=300
 PendingTimeoutSeconds=600
 ConfirmStop=0
@@ -233,7 +523,7 @@ RenameGameWindows=1
 ; Windows are re-checked every second for this many seconds after a game client starts (the game opens and closes windows while loading)
 RenameDurationSeconds=180
 ; Messages such as Stopped / Cancelled / Timed out go back to Idle after this many seconds (0 = never)
-StatusResetSeconds=90
+StatusResetSeconds=30
 ; Background image. Leave BackgroundImage blank to use background.png/jpg/jpeg/bmp/gif found next to the program or in %AppData%\ArcManager;
 ; if none is found, the built-in image is used.
 BackgroundImage=
@@ -265,6 +555,29 @@ PrivateClearBackspaces=0
 PrivateEnterAfterPassword=1
 ; Advanced (not shown in the settings window). PowerShell version only (this program always asks for administrator rights): 1 = restart as administrator
 RunElevated=1
+; ---- Hidden Login: runs the real, official Arc sign-in while every Arc window stays off-screen ----
+; (shared with the C++ version - same keys, same ArcManager.ini). 1 = use it, 0 = fall back to the old visible pop-up method.
+UseHiddenLogin=1
+HiddenKeyDelayMs=20
+HiddenCharDelayMs=20
+HiddenPostTabDelayMs=20
+HiddenPostFieldDelayMs=20
+HiddenHideSettleDelayMs=20
+HiddenSignInTimeoutSeconds=300
+HiddenSignInPollIntervalMs=500
+HiddenMainWindowInitialDelayMs=1600
+HiddenMainWindowTimeoutSeconds=60
+HiddenMainWindowPollIntervalMs=500
+HiddenPatcherWaitTimeoutSeconds=120
+HiddenPatcherWaitPollIntervalMs=500
+; automatically click Start on the launcher/patcher once it appears, so sign-in truly finishes the job.
+; applies to both Launcher Modes (Hidden Arc Mode and Show Arc Mode)
+ClickPatcherStart=1
+PatcherStartPollIntervalMs=2000
+PatcherStartTimeoutSeconds=180
+; Show Arc Mode only: once auto-fill submits the username and password, automatically click Arc's own Play
+; button too, instead of requiring you to click it yourself. Hidden Arc Mode always does this on its own.
+ClickArcPlay=1
 '@
 
 # The settings file is stored as UTF-16 so that folder names with accented / non-Latin letters survive.
@@ -293,9 +606,8 @@ function Get-DefaultValues {
         WindowWidth = 1280; WindowHeight = 720; RememberWindowSize = $true
         AutoFill = $true; UsernameFocusTabs = 1; FieldSeparatorTabs = 1
         LoginDelayMs = 3000; MinWaitSeconds = 6; WindowTimeoutSeconds = 40
-        CloseArcAt = 'launcher'; LauncherGraceSeconds = 2; GraceSeconds = 6
         TimeoutSeconds = 300; PendingTimeoutSeconds = 600
-        ConfirmStop = $false; KillArcOnStart = $true; DebugLog = $true; RenameGameWindows = $true; RenameDurationSeconds = 180; StatusResetSeconds = 90
+        ConfirmStop = $false; KillArcOnStart = $true; DebugLog = $true; RenameGameWindows = $true; RenameDurationSeconds = 180; StatusResetSeconds = 30
         PrivateMode = $false; PrivateShowWarning = $true; PrivateEnterAfterPassword = $true
         PrivateProcessNames = 'elementclient.exe,elementclient_64.exe'
         PrivatePopupKey = 'enter'
@@ -305,6 +617,13 @@ function Get-DefaultValues {
         BackgroundImage = ''; BackgroundMode = 'fill'; BackgroundDim = 0.5
         ShowStorageHint = $false
         PrivateFlags = 'game:cpw nocheck startbypatcher console:1'
+        UseHiddenLogin = $true
+        HiddenKeyDelayMs = 20; HiddenCharDelayMs = 20; HiddenPostTabDelayMs = 20; HiddenPostFieldDelayMs = 20; HiddenHideSettleDelayMs = 20
+        HiddenSignInTimeoutSeconds = 300; HiddenSignInPollIntervalMs = 500
+        HiddenMainWindowInitialDelayMs = 1600; HiddenMainWindowTimeoutSeconds = 60; HiddenMainWindowPollIntervalMs = 500
+        HiddenPatcherWaitTimeoutSeconds = 120; HiddenPatcherWaitPollIntervalMs = 500
+        ClickPatcherStart = $true; PatcherStartPollIntervalMs = 2000; PatcherStartTimeoutSeconds = 180
+        ClickArcPlay = $true
     }
 }
 function Get-IniText([string]$key, [string]$def) { return [IniFile]::Get($IniFile, $key, $def) }
@@ -333,10 +652,6 @@ function Load-Settings {
     $script:LoginDelayMs = Get-IniInt 'LoginDelayMs' $d.LoginDelayMs
     $script:MinWaitSeconds = Get-IniInt 'MinWaitSeconds' $d.MinWaitSeconds
     $script:WindowTimeoutSeconds = Get-IniInt 'WindowTimeoutSeconds' $d.WindowTimeoutSeconds
-    $script:CloseArcAt = 'launcher'
-    if ((Get-IniText 'CloseArcAt' 'launcher').Trim().ToLower() -eq 'game') { $script:CloseArcAt = 'game' }
-    $script:LauncherGraceSeconds = Get-IniInt 'LauncherGraceSeconds' $d.LauncherGraceSeconds
-    $script:GraceSeconds = Get-IniInt 'GraceSeconds' $d.GraceSeconds
     $script:TimeoutSeconds = Get-IniInt 'TimeoutSeconds' $d.TimeoutSeconds
     $script:PendingTimeoutSeconds = Get-IniInt 'PendingTimeoutSeconds' $d.PendingTimeoutSeconds
     $script:ConfirmStop = Get-IniBool 'ConfirmStop' $d.ConfirmStop
@@ -367,6 +682,23 @@ function Load-Settings {
     $script:PrivateTabs = Get-IniInt 'PrivateTabs' $d.PrivateTabs
     $script:PrivateClearBackspaces = Get-IniInt 'PrivateClearBackspaces' $d.PrivateClearBackspaces
     $script:PrivateEnterAfterPassword = Get-IniBool 'PrivateEnterAfterPassword' $d.PrivateEnterAfterPassword
+    $script:UseHiddenLogin = Get-IniBool 'UseHiddenLogin' $d.UseHiddenLogin
+    $script:HiddenKeyDelayMs = Get-IniInt 'HiddenKeyDelayMs' $d.HiddenKeyDelayMs
+    $script:HiddenCharDelayMs = Get-IniInt 'HiddenCharDelayMs' $d.HiddenCharDelayMs
+    $script:HiddenPostTabDelayMs = Get-IniInt 'HiddenPostTabDelayMs' $d.HiddenPostTabDelayMs
+    $script:HiddenPostFieldDelayMs = Get-IniInt 'HiddenPostFieldDelayMs' $d.HiddenPostFieldDelayMs
+    $script:HiddenHideSettleDelayMs = Get-IniInt 'HiddenHideSettleDelayMs' $d.HiddenHideSettleDelayMs
+    $script:HiddenSignInTimeoutSeconds = Get-IniInt 'HiddenSignInTimeoutSeconds' $d.HiddenSignInTimeoutSeconds
+    $script:HiddenSignInPollIntervalMs = Get-IniInt 'HiddenSignInPollIntervalMs' $d.HiddenSignInPollIntervalMs
+    $script:HiddenMainWindowInitialDelayMs = Get-IniInt 'HiddenMainWindowInitialDelayMs' $d.HiddenMainWindowInitialDelayMs
+    $script:HiddenMainWindowTimeoutSeconds = Get-IniInt 'HiddenMainWindowTimeoutSeconds' $d.HiddenMainWindowTimeoutSeconds
+    $script:HiddenMainWindowPollIntervalMs = Get-IniInt 'HiddenMainWindowPollIntervalMs' $d.HiddenMainWindowPollIntervalMs
+    $script:HiddenPatcherWaitTimeoutSeconds = Get-IniInt 'HiddenPatcherWaitTimeoutSeconds' $d.HiddenPatcherWaitTimeoutSeconds
+    $script:HiddenPatcherWaitPollIntervalMs = Get-IniInt 'HiddenPatcherWaitPollIntervalMs' $d.HiddenPatcherWaitPollIntervalMs
+    $script:ClickPatcherStart = Get-IniBool 'ClickPatcherStart' $d.ClickPatcherStart
+    $script:PatcherStartPollIntervalMs = Get-IniInt 'PatcherStartPollIntervalMs' $d.PatcherStartPollIntervalMs
+    $script:PatcherStartTimeoutSeconds = Get-IniInt 'PatcherStartTimeoutSeconds' $d.PatcherStartTimeoutSeconds
+    $script:ClickArcPlay = Get-IniBool 'ClickArcPlay' $d.ClickArcPlay
     $script:DebugLog = Get-IniBool 'DebugLog' $d.DebugLog
     $script:BackgroundImage = (Get-IniText 'BackgroundImage' '').Trim()
     $script:BackgroundMode = (Get-IniText 'BackgroundMode' 'fill').Trim().ToLower()
@@ -376,7 +708,7 @@ function Load-Settings {
     $script:BackgroundDim = [math]::Min(1.0, [math]::Max(0.0, $dim))
     # clean-up of settings that were removed in later versions
     $none = [string][char]1
-    foreach ($old in @('PrivateStartDir', 'PrivateNoticeShown')) {
+    foreach ($old in @('PrivateStartDir', 'PrivateNoticeShown', 'LauncherGraceSeconds', 'GraceSeconds', 'CloseArcAt')) {
         if ([IniFile]::Get($IniFile, $old, $none) -ne $none) { [void][IniFile]::Remove($IniFile, $old) }
     }
 }
@@ -469,6 +801,9 @@ $cAmber = [System.Drawing.Color]::FromArgb(240, 170, 60)
 $script:Rows   = New-Object System.Collections.ArrayList
 $script:Active = $null
 $script:LastDesc = ''
+$script:HiddenState = $null
+$script:HiddenPopup = $null
+$script:StartingPopup = $null
 $script:IsAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 
 function Get-GamePids {
@@ -522,6 +857,20 @@ function Set-Status($row, [string]$text, $color, [bool]$transient = $false) {
 function Get-LaunchToolPids {
     @(Get-Process -Name 'launcher', 'patcher' -ErrorAction SilentlyContinue | ForEach-Object { $_.Id })
 }
+# true if any other row is still signing in or waiting for its own game client (its launcher / patcher must be left alone)
+function Test-OtherSignInsBusy($row) {
+    if ($script:Active -ne $null -and $script:Active.Row -ne $row) { return $true }
+    foreach ($r in $script:Rows) { if ($r -ne $row -and $r.Pending -ne $null) { return $true } }
+    return $false
+}
+# the game client just started: force-close the launcher.exe / patcher.exe that this sign-in started (the patcher can
+# take a long time to close by itself). Skipped if another sign-in is under way, so its launcher is never hit.
+function Stop-LaunchTools($launchBase, $row) {
+    if (Test-OtherSignInsBusy $row) { Write-Log 'game client detected - another sign-in is under way, leaving launcher/patcher alone'; return }
+    $closed = 0
+    foreach ($p in (Get-LaunchToolPids | Where-Object { $launchBase -notcontains $_ })) { Stop-ProcessLogged $p; $closed++ }
+    if ($closed -gt 0) { Write-Log ('game client detected - force-closed ' + $closed + ' launcher/patcher process(es)') }
+}
 function Close-LaunchLeftovers($launchBase) {
     $arc = @(Get-ArcPids)
     foreach ($p in $arc) { Stop-ProcessLogged $p }
@@ -560,6 +909,76 @@ function Finish-Active([string]$text, $color, [bool]$transient = $false) {
         $script:Active = $null
     }
 }
+# small always-on-top notice shown during a long async wait so the user doesn't think the program froze.
+# Shared by both status popups ("Obtaining ARC / PWI TOKEN Now" and "Starting Game") - same size and font either way.
+function New-StatusPopup([string]$text) {
+    $p = New-Object System.Windows.Forms.Form
+    $p.Text = 'ArcManager'
+    $p.FormBorderStyle = 'FixedDialog'
+    $p.ControlBox = $false
+    $p.MinimizeBox = $false
+    $p.MaximizeBox = $false
+    $p.ShowInTaskbar = $false
+    $p.StartPosition = 'CenterScreen'
+    $p.TopMost = $true
+    $p.ClientSize = New-Object System.Drawing.Size(500, 300)
+    $lbl = New-Object System.Windows.Forms.Label
+    $lbl.Text = $text
+    $lbl.TextAlign = 'MiddleCenter'
+    $lbl.Dock = 'Fill'
+    $lbl.Font = New-Object System.Drawing.Font('Segoe UI', 14)
+    $p.Controls.Add($lbl)
+    try { $p.Show($form) } catch { $p.Show() }
+    $p
+}
+function Close-StatusPopup([ref]$popupVar) {
+    if ($popupVar.Value -ne $null) {
+        try { $popupVar.Value.Close() } catch { }
+        try { $popupVar.Value.Dispose() } catch { }
+        $popupVar.Value = $null
+    }
+}
+function Show-HiddenPopup {
+    if ($script:HiddenPopup -ne $null) { return }
+    $script:HiddenPopup = New-StatusPopup 'Obtaining ARC / PWI TOKEN Now'
+}
+function Close-HiddenPopup {
+    Close-StatusPopup ([ref]$script:HiddenPopup)
+}
+# shown while the manager is auto-clicking Start on the launcher/patcher (either Launcher Mode); closed the
+# instant the real game client (elementclient.exe / elementclient_64.exe) is detected.
+function Show-StartingPopup {
+    if ($script:StartingPopup -ne $null) { return }
+    $script:StartingPopup = New-StatusPopup 'Starting Game'
+}
+function Close-StartingPopup {
+    Close-StatusPopup ([ref]$script:StartingPopup)
+}
+# polled once a second from Update-State while $script:Active.Phase is 'hidden'. Result codes match the C++
+# HiddenLoginResult enum: 0=Success 1=ArcLaunchFailed 2=SignInWindowNotFound 3=MainWindowNotFound 4=PatcherNotDetected 5=Cancelled.
+# The hidden-login thread always kills Arc itself before reporting back (success, failure or cancel alike), so none
+# of these branches need to touch Arc - they only update the row.
+function Update-HiddenLogin {
+    $a = $script:Active
+    $hs = $script:HiddenState
+    if ($hs -eq $null -or -not $hs.Done) { return }
+    $result = [int]$hs.Result
+    $script:HiddenState = $null
+    Close-HiddenPopup
+    switch ($result) {
+        0 {
+            $a.Row.Pending = @{ Since = Get-Date; Base = $a.GameBase; LaunchBase = $a.LaunchBase; LastStartClickAt = $null; SawTool = $false; ToolFirstSeenAt = $null; HideTools = $true }   # Hidden Arc Mode: keep the launcher/patcher off-screen too
+            Finish-Active 'Launcher started - waiting for the game client (CANCEL to stop)' $cWhite
+            $a.Row.Button.Text = 'CANCEL'
+        }
+        1 { Finish-Active 'Could not start Arc.exe' $cAmber $true }
+        2 { Finish-Active "Timed out waiting for Arc's Sign In window" $cAmber $true }
+        3 { Finish-Active "Signed in, but Arc's main window never appeared" $cAmber $true }
+        4 { Finish-Active 'Signed in, but the launcher/patcher never started' $cAmber $true }
+        5 { Finish-Active 'Cancelled - Arc was closed' $cGray $true }
+        default { Finish-Active 'Hidden login failed' $cAmber $true }
+    }
+}
 # escape characters that SendKeys treats as special
 function Escape-Keys([string]$s) {
     $sb = New-Object System.Text.StringBuilder
@@ -577,6 +996,10 @@ function Use-Fallback($a, [string]$why) {
     Set-Status $a.Row ($why + ' - sign in manually (name copied)') $cAmber
 }
 
+# returns $true only if the username and password were both typed AND the login was actually submitted (Enter
+# pressed after the password) - i.e. only when it's safe to go looking for Arc's Play button on our own (see
+# ClickArcPlay / the 'clickplay' phase in Update-State). Every other outcome (no saved password, lost focus,
+# Enter not sent) means the person still has to finish signing in themselves, so auto-clicking Play would be premature.
 function Invoke-AutoFill($a) {
     $row  = $a.Row
     $user = $row.Box.Text.Trim()
@@ -591,7 +1014,7 @@ function Invoke-AutoFill($a) {
         Start-Sleep -Milliseconds 500
     }
     Write-Log ('after focus attempt: foreground pid=' + [WinHelper]::GetForegroundPid() + ' arc pids=' + ($a.ArcPids -join ','))
-    if (-not (Test-ArcFocused $a.ArcPids)) { Write-Log 'Arc not focused - fallback'; Use-Fallback $a 'Could not focus Arc'; return }
+    if (-not (Test-ArcFocused $a.ArcPids)) { Write-Log 'Arc not focused - fallback'; Use-Fallback $a 'Could not focus Arc'; return $false }
 
     for ($k = 0; $k -lt $EntersBefore; $k++) {   # a message before the login page (not needed by Arc today): Enter or Escape
         if ($PopupKey -eq 'escape') { [System.Windows.Forms.SendKeys]::SendWait('{ESC}') } else { [System.Windows.Forms.SendKeys]::SendWait('{ENTER}') }
@@ -610,20 +1033,27 @@ function Invoke-AutoFill($a) {
 
     if ($pass -eq '') {
         Set-Status $row 'Username typed - no password saved, enter it in Arc' $cAmber
-        return
+        return $false
     }
     # safety: never type the password into some other window
     if (-not (Test-ArcFocused $a.ArcPids)) {
         Set-Status $row 'Focus left Arc - password was NOT typed' $cAmber
-        return
+        return $false
     }
     Write-Log ('typing password (' + $pass.Length + ' chars), foreground pid=' + [WinHelper]::GetForegroundPid())
     [System.Windows.Forms.SendKeys]::SendWait('^a')
     if ($ClearBackspaces -gt 0) { [System.Windows.Forms.SendKeys]::SendWait('{END}{BACKSPACE ' + $ClearBackspaces + '}') }
     [System.Windows.Forms.SendKeys]::SendWait((Escape-Keys $pass))
     Start-Sleep -Milliseconds 200
-    if ($EnterAfterPassword) { [System.Windows.Forms.SendKeys]::SendWait('{ENTER}') }
-    Set-Status $row ("Signed in as '" + $user + "' - click Play in Arc") $cWhite
+    if (-not $EnterAfterPassword) {
+        Set-Status $row ("Signed in as '" + $user + "' - press Enter / click Sign In, then click Play in Arc") $cWhite
+        return $false
+    }
+    [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
+    $playMsg = "Signed in as '" + $user + "'"
+    if ($ClickArcPlay) { $playMsg += ' - clicking Play...' } else { $playMsg += ' - click Play in Arc' }
+    Set-Status $row $playMsg $cWhite
+    return $true
 }
 
 function Stop-Client($row) {
@@ -837,6 +1267,13 @@ function Start-Play($row) {
     # clicking the button of the row that is currently waiting = cancel
     if ($script:Active -ne $null) {
         if ($script:Active.Row -eq $row) {
+            if ($script:Active.Phase -eq 'hidden') {
+                # the hidden-login thread is still running: ask it to stop rather than touching Arc from here.
+                # It checks this flag between steps, kills Arc itself, and reports back (Cancelled) via Update-HiddenLogin.
+                if ($script:HiddenState -ne $null) { $script:HiddenState.Cancel = $true }
+                Set-Status $row 'Cancelling - this can take a few seconds' $cWhite
+                return
+            }
             Close-LaunchLeftovers $script:Active.LaunchBase
             if ($row.GamePid) { Finish-Active ('Running (PID ' + $row.GamePid + ')') $cGreen }   # the game client was already up
             else { Finish-Active 'Cancelled - Arc, launcher and patcher closed' $cGray $true }
@@ -869,6 +1306,42 @@ function Start-Play($row) {
         return
     }
 
+    if ($UseHiddenLogin) {
+        Save-Accounts
+        Write-Log ('---- SIGN IN (hidden), row ' + ($script:Rows.IndexOf($row) + 1) + ' ----')
+        Write-Log ('manager elevated=' + $script:IsAdmin)
+        $script:Active = @{
+            Row = $row; Phase = 'hidden'; Start = Get-Date
+            GameBase = (Get-GamePids); ArcBase = (Get-ArcPids); LaunchBase = (Get-LaunchToolPids)
+            ArcPids = @(); Hwnd = [int64]0; HwndSince = Get-Date; SeenAt = $null; Trigger = ''
+        }
+        $script:HiddenState = New-Object HiddenLoginState
+        $hs = New-Object HiddenLoginSettings
+        $hs.ArcPath = $ArcPath
+        $hs.Username = $name
+        $hs.Password = $row.Pass.Text
+        $hs.KeyDelayMs = $HiddenKeyDelayMs
+        $hs.CharDelayMs = $HiddenCharDelayMs
+        $hs.PostTabDelayMs = $HiddenPostTabDelayMs
+        $hs.PostFieldDelayMs = $HiddenPostFieldDelayMs
+        $hs.HideSettleDelayMs = $HiddenHideSettleDelayMs
+        $hs.SignInTimeoutSec = $HiddenSignInTimeoutSeconds
+        $hs.SignInPollIntervalMs = $HiddenSignInPollIntervalMs
+        $hs.MainWindowInitialDelayMs = $HiddenMainWindowInitialDelayMs
+        $hs.MainWindowTimeoutSec = $HiddenMainWindowTimeoutSeconds
+        $hs.MainWindowPollIntervalMs = $HiddenMainWindowPollIntervalMs
+        $hs.PatcherWaitTimeoutSec = $HiddenPatcherWaitTimeoutSeconds
+        $hs.PatcherWaitPollIntervalMs = $HiddenPatcherWaitPollIntervalMs
+        $hs.ClickPatcherStart = [bool]$ClickPatcherStart
+        $hs.PatcherStartPollIntervalMs = $PatcherStartPollIntervalMs
+        $hs.PatcherStartTimeoutSec = $PatcherStartTimeoutSeconds
+        [HiddenLogin]::Start($hs, $script:HiddenState)
+        $row.Button.Text = 'CANCEL'
+        Set-Status $row 'Signing in hidden - this can take a minute (CANCEL to stop)' $cWhite
+        Show-HiddenPopup
+        return
+    }
+
     # a still-running Arc would just take focus instead of starting fresh, so close it first
     $existing = @(Get-ArcPids)
     if ($existing.Count -gt 0) {
@@ -889,7 +1362,7 @@ function Start-Play($row) {
     $script:Active = @{
         Row = $row; Phase = $phase; Start = Get-Date
         GameBase = (Get-GamePids); ArcBase = (Get-ArcPids); LaunchBase = (Get-LaunchToolPids)
-        ArcPids = @(); Hwnd = [int64]0; HwndSince = Get-Date; SeenAt = $null; Trigger = ''
+        ArcPids = @(); Hwnd = [int64]0; HwndSince = Get-Date; SeenAt = $null; Trigger = ''; PlayClickStart = $null
     }
     Start-Process -FilePath $ArcPath -WorkingDirectory (Split-Path $ArcPath)
     Write-Log 'started Arc.exe'
@@ -902,6 +1375,18 @@ function Start-Play($row) {
     }
 }
 
+# Hidden Arc Mode: the game's launcher / patcher window is kept off-screen too, the same way Arc's is. Runs 10 times a
+# second, only while a Hidden Arc Mode row is waiting for its game client; Show Arc Mode rows are never touched.
+function Hide-LaunchToolWindows {
+    $base = @()
+    $any = $false
+    foreach ($r in $script:Rows) {
+        if ($r.Pending -ne $null -and $r.Pending.HideTools) { $any = $true; $base += @($r.Pending.LaunchBase) }
+    }
+    if (-not $any) { return }
+    $tools = @(Get-LaunchToolPids | Where-Object { $base -notcontains $_ })
+    if ($tools.Count -gt 0) { [WinHelper]::MoveOffScreen([int[]]$tools) }
+}
 function Update-State {
     # mark rows whose game client has exited
     foreach ($r in $script:Rows) {
@@ -921,6 +1406,30 @@ function Update-State {
             Write-Log 'pending launch timed out'
         }
     }
+
+    # Arc is already closed and we're waiting for the game client (true for both Launcher Modes - Hidden Arc
+    # Mode's own thread returns the instant the launcher/patcher is detected, so from here on it is just a
+    # pending row like Show Arc Mode's), so automatically click Start on the launcher/patcher until it closes
+    # or we time out. The "Starting Game" popup (separate from the "Obtaining ARC / PWI TOKEN Now" popup, which
+    # already closed) covers this whole phase, in both modes alike.
+    if ($UseHiddenLogin -or $ClickPatcherStart) {
+        foreach ($pr in @($script:Rows | Where-Object { $_.Pending -ne $null })) {
+            if (((Get-Date) - $pr.Pending.Since).TotalSeconds -gt $PatcherStartTimeoutSeconds) { continue }
+            if ($pr.Pending.LastStartClickAt -ne $null -and ((Get-Date) - $pr.Pending.LastStartClickAt).TotalMilliseconds -lt $PatcherStartPollIntervalMs) { continue }
+            $pr.Pending.LastStartClickAt = Get-Date
+            $toolPids = @(Get-LaunchToolPids | Where-Object { $pr.Pending.LaunchBase -notcontains $_ })
+            if ($toolPids.Count -eq 0) {
+                # only trust this as "Start worked and it closed" once we actually saw it running; an empty read
+                # before that just means it has not finished launching yet (the launcher.exe process it starts as
+                # can briefly hand off to patcher.exe, with neither name matching for an instant)
+                continue
+            }
+            if (-not $pr.Pending.SawTool) { $pr.Pending.SawTool = $true; $pr.Pending.ToolFirstSeenAt = Get-Date; continue }   # give it a moment to reach its real size before the first click
+            if (((Get-Date) - $pr.Pending.ToolFirstSeenAt).TotalMilliseconds -lt 1500) { continue }   # still settling
+            $toolHwnd = [WinHelper]::FindVisibleWindow([int[]]$toolPids)
+            if ($toolHwnd -ne [IntPtr]::Zero -and [WinHelper]::ClientAtLeast($toolHwnd, 900, 650)) { [HiddenLogin]::ClickAt($toolHwnd, 853, 557) }   # the patcher's Start button (confirmed coordinate)
+        }
+    }
     $pendingRows = @($script:Rows | Where-Object { $_.Pending -ne $null } | Sort-Object { $_.Pending.Since })
     if ($pendingRows.Count -gt 0) {
         $claimed = @(Get-ClaimedPids)
@@ -928,21 +1437,35 @@ function Update-State {
             if ($claimed -contains $gp) { continue }
             foreach ($pr in $pendingRows) {
                 if ($pr.Pending -ne $null -and $pr.Pending.Base -notcontains $gp) {
+                    $launchBase = $pr.Pending.LaunchBase
                     $pr.GamePid = $gp
                     $pr.Pending = $null
                     $pr.Button.Text = 'SIGN IN'
                     $claimed += $gp
                     Set-Status $pr ('Running (PID ' + $gp + ')') $cGreen
                     Write-Log ('assigned game client ' + $gp + ' to a pending row')
+                    Stop-LaunchTools $launchBase $pr
                     break
                 }
             }
         }
     }
 
+    # "Starting Game" covers the whole click-Start phase above; close it the instant no row is in that phase any
+    # more - including the instant a row above just got matched to a real elementclient.exe / elementclient_64.exe
+    # (Get-GamePids only matches those two process names in non-private mode), and on cancel or timeout too.
+    $stillStarting = $false
+    if ($UseHiddenLogin -or $ClickPatcherStart) {
+        foreach ($pr in @($script:Rows | Where-Object { $_.Pending -ne $null })) {
+            if (((Get-Date) - $pr.Pending.Since).TotalSeconds -le $PatcherStartTimeoutSeconds) { $stillStarting = $true; break }
+        }
+    }
+    if ($stillStarting) { Show-StartingPopup } else { Close-StartingPopup }
+
     $a = $script:Active
     if ($a -eq $null) { return }
     if ($a.Priv) { return }   # a private-server sign-in is handled by Private-Tick
+    if ($a.Phase -eq 'hidden') { Update-HiddenLogin; return }
     $elapsed = ((Get-Date) - $a.Start).TotalSeconds
     $a.ArcPids = @(Get-ArcPids | Where-Object { $a.ArcBase -notcontains $_ })
 
@@ -950,7 +1473,7 @@ function Update-State {
     $claimed = @(Get-ClaimedPids)
     $new = @(Get-GamePids | Where-Object { $a.GameBase -notcontains $_ -and $claimed -notcontains $_ })
     $launch = @()
-    if ($CloseArcAt -eq 'launcher') { $launch = @(Get-ArcLauncherPids $a.ArcPids) }
+    $launch = @(Get-ArcLauncherPids $a.ArcPids)   # launcher.exe / patcher.exe started by THIS Arc
     if ($a.Phase -ne 'closing' -and ($new.Count -gt 0 -or $launch.Count -gt 0)) {
         $a.Phase = 'closing'
         $a.SeenAt = Get-Date
@@ -980,12 +1503,26 @@ function Update-State {
             } elseif (((Get-Date) - $a.HwndSince).TotalMilliseconds -ge $LoginDelayMs -and $elapsed -ge $MinWaitSeconds) {
                 $a.Phase = 'waiting'
                 Write-Log ('window ' + $hv + ' stable, ' + [int]$elapsed + 's since start -> typing')
-                Invoke-AutoFill $a
+                $submitted = Invoke-AutoFill $a
+                if ($submitted -and $ClickArcPlay) { $a.Phase = 'clickplay'; $a.PlayClickStart = Get-Date }
             }
         } elseif ($elapsed -gt $WindowTimeoutSeconds) {
             $a.Phase = 'waiting'
             Write-Log 'timed out finding a visible Arc window'
             Use-Fallback $a "Couldn't find Arc's login window"
+        }
+    }
+    elseif ($a.Phase -eq 'clickplay') {
+        # Show Arc Mode: credentials were submitted; wait for Arc to swap from the login page to its real
+        # library/Play page (clicking too soon can hit an unfinished placeholder instead) and click Play there -
+        # the same confirmed coordinate Hidden Arc Mode uses, found the same way (FindArcMainWindow)
+        if ($elapsed -gt $TimeoutSeconds) { Finish-Active 'Timed out waiting for a game client' $cAmber $true; return }
+        if (((Get-Date) - $a.PlayClickStart).TotalMilliseconds -lt 1500) { return }   # give Arc a moment to swap pages before the first attempt
+        $mainHwnd = [HiddenLogin]::FindArcMainWindow()
+        if ($mainHwnd -ne [IntPtr]::Zero) {
+            [HiddenLogin]::ClickAt($mainHwnd, 288, 405)   # Arc's Play button (confirmed coordinate)
+            Write-Log 'clicked Play automatically (show arc mode)'
+            $a.Phase = 'waiting'
         }
     }
     elseif ($a.Phase -eq 'waiting') {
@@ -994,27 +1531,18 @@ function Update-State {
         }
     }
     elseif ($a.Phase -eq 'closing') {
-        $grace = $GraceSeconds
-        if ($a.Trigger -eq 'launcher') { $grace = $LauncherGraceSeconds }
-        $left = $grace - ((Get-Date) - $a.SeenAt).TotalSeconds
-        if ($left -gt 0) {
-            if ($a.Trigger -eq 'launcher') {
-                Set-Status $a.Row ("Launcher started - closing Arc in " + [int][math]::Ceiling($left) + "s") $cGreen
-            } else {
-                Set-Status $a.Row ("Game running (PID " + $a.Row.GamePid + ") - closing Arc in " + [int][math]::Ceiling($left) + "s") $cGreen
-            }
-            return
-        }
+        # no delay: Arc is closed the instant the launcher/patcher (or game client) is detected
         # close only the Arc process(es) that were started for this launch
         foreach ($p in (Get-ArcPids | Where-Object { $a.ArcBase -notcontains $_ })) {
             Stop-ProcessLogged $p
         }
         if ($a.Row.GamePid) {
+            Stop-LaunchTools $a.LaunchBase $a.Row
             Finish-Active ("Running (PID " + $a.Row.GamePid + ")") $cGreen
         } else {
             # Arc is closed; the row picks up its game client when it appears
             $waitRow = $a.Row
-            $waitRow.Pending = @{ Since = Get-Date; Base = $a.GameBase; LaunchBase = $a.LaunchBase }
+            $waitRow.Pending = @{ Since = Get-Date; Base = $a.GameBase; LaunchBase = $a.LaunchBase; LastStartClickAt = $null; SawTool = $false; ToolFirstSeenAt = $null; HideTools = $false }   # Show Arc Mode: the launcher/patcher stays visible
             Finish-Active 'Arc closed - waiting for game client (CANCEL to stop)' $cWhite
             $waitRow.Button.Text = 'CANCEL'
         }
@@ -1236,8 +1764,6 @@ $script:NumFields = @(
     @{ Key = 'LoginDelayMs';          Label = 'Login delay (milliseconds)';     Min = 0;   Max = 60000 },
     @{ Key = 'MinWaitSeconds';        Label = 'Minimum wait (seconds)';         Min = 0;   Max = 600 },
     @{ Key = 'WindowTimeoutSeconds';  Label = 'Login window timeout (seconds)'; Min = 1;   Max = 600 },
-    @{ Key = 'LauncherGraceSeconds';  Label = 'Delay after launcher (seconds)'; Min = 0;   Max = 600 },
-    @{ Key = 'GraceSeconds';          Label = 'Delay after game (seconds)';     Min = 0;   Max = 600 },
     @{ Key = 'TimeoutSeconds';        Label = 'Give up after (seconds)';        Min = 10;  Max = 86400 },
     @{ Key = 'PendingTimeoutSeconds'; Label = 'Game wait after close (seconds)'; Min = 10; Max = 86400 },
     @{ Key = 'RenameDurationSeconds'; Label = 'Rename duration (seconds)';      Min = 10;  Max = 3600 },
@@ -1251,16 +1777,35 @@ $script:NumFields = @(
     @{ Key = 'PrivateClearBackspaces';      Label = 'Backspaces to clear a box';       Min = 0; Max = 60 },
     @{ Key = 'EntersBefore';                Label = 'Enter/Escape presses for the pop-up'; Min = 0; Max = 10 },
     @{ Key = 'PauseAfterPopupMs';           Label = 'Pause after the pop-up (ms)';     Min = 0; Max = 60000 },
-    @{ Key = 'ClearBackspaces';             Label = 'Backspaces to clear a box';       Min = 0; Max = 60 }
+    @{ Key = 'ClearBackspaces';             Label = 'Backspaces to clear a box';       Min = 0; Max = 60 },
+    @{ Key = 'HiddenKeyDelayMs';            Label = 'Key press hold (ms)';             Min = 0; Max = 5000 },
+    @{ Key = 'HiddenCharDelayMs';           Label = 'Delay between characters (ms)';   Min = 0; Max = 5000 },
+    @{ Key = 'HiddenPostTabDelayMs';        Label = 'Pause after Tab (ms)';            Min = 0; Max = 5000 },
+    @{ Key = 'HiddenPostFieldDelayMs';      Label = 'Pause after each box (ms)';       Min = 0; Max = 5000 },
+    @{ Key = 'HiddenHideSettleDelayMs';     Label = 'Pause after hiding (ms)';         Min = 0; Max = 5000 },
+    @{ Key = 'HiddenSignInTimeoutSeconds';  Label = 'Give up finding Sign In (sec)';   Min = 1; Max = 3600 },
+    @{ Key = 'HiddenSignInPollIntervalMs';  Label = 'Check for Sign In every (ms)';    Min = 100; Max = 10000 },
+    @{ Key = 'HiddenMainWindowInitialDelayMs'; Label = 'Wait before looking for Play (ms)'; Min = 0; Max = 20000 },
+    @{ Key = 'HiddenMainWindowTimeoutSeconds'; Label = 'Give up finding Play (sec)';   Min = 1; Max = 3600 },
+    @{ Key = 'HiddenMainWindowPollIntervalMs'; Label = 'Check for Play every (ms)';    Min = 100; Max = 10000 },
+    @{ Key = 'HiddenPatcherWaitTimeoutSeconds'; Label = 'Watch for the launcher (sec)'; Min = 0; Max = 3600 },
+    @{ Key = 'HiddenPatcherWaitPollIntervalMs'; Label = 'Check for the launcher every (ms)'; Min = 100; Max = 10000 },
+    # clicking Start on the launcher/patcher (applies to both Launcher Modes)
+    @{ Key = 'PatcherStartPollIntervalMs';   Label = 'Click Start every (ms)';       Min = 200; Max = 60000 },
+    @{ Key = 'PatcherStartTimeoutSeconds';   Label = 'Give up clicking after (sec)'; Min = 1;   Max = 3600 }
 )
 # on/off settings (tick boxes)
-$script:BoolFields = @('RememberWindowSize', 'AutoFill', 'ConfirmStop', 'KillArcOnStart', 'DebugLog', 'RenameGameWindows', 'ShowStorageHint', 'PrivateEnterAfterPassword', 'PrivateShowWarning', 'EnterAfterPassword')
+$script:BoolFields = @('RememberWindowSize', 'AutoFill', 'ConfirmStop', 'KillArcOnStart', 'DebugLog', 'RenameGameWindows', 'ShowStorageHint', 'PrivateEnterAfterPassword', 'PrivateShowWarning', 'EnterAfterPassword', 'ClickPatcherStart', 'ClickArcPlay')
 $script:ModeNames  = @('fill', 'fit', 'stretch', 'tile', 'center')
 $script:ModeLabels = @('Fill', 'Fit', 'Stretch', 'Tile', 'Center')
 $script:Ui = @{}
-$script:PageBasic = New-Object System.Collections.ArrayList   # the controls of the two pages (Basic / Advanced)
+$script:PageBasic = New-Object System.Collections.ArrayList   # the controls of each top-level page (PageAdv = controls shown for Advanced regardless of sub-tab)
 $script:PageAdv = New-Object System.Collections.ArrayList
 $script:PagePriv = New-Object System.Collections.ArrayList
+$script:PageAdvShared = New-Object System.Collections.ArrayList   # Advanced / Shared Settings sub-tab
+$script:PageAdvHidden = New-Object System.Collections.ArrayList   # Advanced / Hidden Arc Mode sub-tab
+$script:PageAdvShow = New-Object System.Collections.ArrayList     # Advanced / Show Arc Mode sub-tab
+$script:AdvSub = 0   # 0 = Shared Settings (default), 1 = Hidden Arc Mode, 2 = Show Arc Mode
 $script:PageList = $null                                       # while building: which page the new controls belong to
 $script:SetDlg = $null
 $script:SetTip = $null
@@ -1269,7 +1814,7 @@ $script:SetLoading = $false
 $script:SetBuilt = $false
 
 function Get-CurrentValues {
-    $v = @{ PopupKey = $PopupKey; PrivatePopupKey = $PrivatePopupKey; PrivateClientPath = $PrivateClientPath; PrivateFlags = $PrivateFlags; PrivateProcessNames = $PrivateProcessNames; ArcPath = $ArcPath; CloseArcAt = $CloseArcAt; BackgroundImage = $BackgroundImage; BackgroundMode = $BackgroundMode; BackgroundDim = $BackgroundDim }
+    $v = @{ PopupKey = $PopupKey; PrivatePopupKey = $PrivatePopupKey; PrivateClientPath = $PrivateClientPath; PrivateFlags = $PrivateFlags; PrivateProcessNames = $PrivateProcessNames; ArcPath = $ArcPath; BackgroundImage = $BackgroundImage; BackgroundMode = $BackgroundMode; BackgroundDim = $BackgroundDim; UseHiddenLogin = [bool]$UseHiddenLogin }
     foreach ($f in $script:NumFields) { $v[$f.Key] = [int](Get-Variable -Name $f.Key -Scope Script -ValueOnly) }
     foreach ($k in $script:BoolFields) { $v[$k] = [bool](Get-Variable -Name $k -Scope Script -ValueOnly) }
     return $v
@@ -1282,13 +1827,18 @@ function Update-SEnabled {
     $priv = [bool]$PrivateMode   # private server mode: the Arc settings are not used, so they are greyed out
     $af = $u['AutoFill'].Checked
     foreach ($k in @('UsernameFocusTabs', 'FieldSeparatorTabs', 'LoginDelayMs', 'MinWaitSeconds', 'WindowTimeoutSeconds', 'EntersBefore', 'PauseAfterPopupMs', 'ClearBackspaces', 'EnterAfterPassword', 'PopEnter', 'PopEsc')) { $u[$k].Enabled = ($af -and -not $priv) }
-    $l = $u['CloseLauncher'].Checked
-    $u['LauncherGraceSeconds'].Enabled = ($l -and -not $priv)
-    $u['PendingTimeoutSeconds'].Enabled = ($l -and -not $priv)
-    $u['GraceSeconds'].Enabled = ((-not $l) -and -not $priv)
+    $u['PendingTimeoutSeconds'].Enabled = (-not $priv)
     $u['TimeoutSeconds'].Enabled = (-not $priv)
     $u['RenameDurationSeconds'].Enabled = $u['RenameGameWindows'].Checked
-    foreach ($k in @('ArcPath', 'BrowseArc', 'CloseLauncher', 'CloseGame', 'KillArcOnStart')) { $u[$k].Enabled = (-not $priv) }
+    foreach ($k in @('ArcPath', 'BrowseArc', 'ModeHidden', 'ModeShow', 'KillArcOnStart')) { $u[$k].Enabled = (-not $priv) }
+    $hl = $u['ModeHidden'].Checked
+    $u['ClickPatcherStart'].Enabled = (-not $priv -and -not $hl)   # Show Arc Mode only - Hidden Arc Mode always clicks Start
+    $u['PatcherStartPollIntervalMs'].Enabled = (-not $priv -and ($u['ClickPatcherStart'].Checked -or $hl))
+    $u['PatcherStartTimeoutSeconds'].Enabled = (-not $priv -and ($u['ClickPatcherStart'].Checked -or $hl))
+    foreach ($k in @('HiddenKeyDelayMs', 'HiddenCharDelayMs', 'HiddenPostTabDelayMs', 'HiddenPostFieldDelayMs', 'HiddenHideSettleDelayMs', 'HiddenSignInTimeoutSeconds', 'HiddenSignInPollIntervalMs', 'HiddenMainWindowInitialDelayMs', 'HiddenMainWindowTimeoutSeconds', 'HiddenMainWindowPollIntervalMs', 'HiddenPatcherWaitTimeoutSeconds', 'HiddenPatcherWaitPollIntervalMs')) { $u[$k].Enabled = ($hl -and -not $priv) }
+    # the hidden method replaces the old visible pop-up/typing method, so grey the old one out while it is on
+    foreach ($k in @('UsernameFocusTabs', 'FieldSeparatorTabs', 'LoginDelayMs', 'MinWaitSeconds', 'WindowTimeoutSeconds', 'EntersBefore', 'PauseAfterPopupMs', 'ClearBackspaces', 'EnterAfterPassword', 'PopEnter', 'PopEsc', 'AutoFill')) { if ($u[$k].Enabled) { $u[$k].Enabled = -not $hl } }
+    $u['ClickArcPlay'].Enabled = ($af -and -not $priv -and -not $hl)   # Show Arc Mode only - needs auto-fill to have submitted the credentials first
 }
 function Update-DimLabel {
     if ($script:Ui['DimLbl'] -eq $null) { return }
@@ -1309,12 +1859,12 @@ function Set-UiFromValues($v) {
     $u['PrivateProcessNames'].Text = [string]$v['PrivateProcessNames']
     foreach ($f in $script:NumFields) { $u[$f.Key].Text = [string]$v[$f.Key] }
     foreach ($k in $script:BoolFields) { $u[$k].Checked = [bool]$v[$k] }
-    $u['CloseLauncher'].Checked = ($v['CloseArcAt'] -ne 'game')
+    $u['ModeHidden'].Checked = [bool]$v['UseHiddenLogin']
+    $u['ModeShow'].Checked = -not [bool]$v['UseHiddenLogin']
     $u['PopEnter'].Checked = ($v['PopupKey'] -ne 'escape')
     $u['PopEsc'].Checked = ($v['PopupKey'] -eq 'escape')
     $u['PopupEnter'].Checked = ($v['PrivatePopupKey'] -ne 'escape')
     $u['PopupEsc'].Checked = ($v['PrivatePopupKey'] -eq 'escape')
-    $u['CloseGame'].Checked = ($v['CloseArcAt'] -eq 'game')
     $u['BackgroundImage'].Text = [string]$v['BackgroundImage']
     $mi = 0
     for ($i = 0; $i -lt 5; $i++) { if ($v['BackgroundMode'] -eq $script:ModeNames[$i]) { $mi = $i } }
@@ -1363,12 +1913,11 @@ function Read-UiValues {
         $v[$f.Key] = $n
     }
     foreach ($k in $script:BoolFields) { $v[$k] = [bool]$u[$k].Checked }
+    $v['UseHiddenLogin'] = [bool]$u['ModeHidden'].Checked
     $v['PopupKey'] = 'enter'
     if ($u['PopEsc'].Checked) { $v['PopupKey'] = 'escape' }
     $v['PrivatePopupKey'] = 'enter'
     if ($u['PopupEsc'].Checked) { $v['PrivatePopupKey'] = 'escape' }
-    $v['CloseArcAt'] = 'game'
-    if ($u['CloseLauncher'].Checked) { $v['CloseArcAt'] = 'launcher' }
     $bg = $u['BackgroundImage'].Text.Trim()
     if ($bg -ne '' -and -not (Test-Path -LiteralPath $bg)) {
         Show-SWarn ("The background image file was not found:`n" + $bg + "`n`nFix the path, or clear the box to use the default background.") $u['BackgroundImage']
@@ -1388,7 +1937,7 @@ function Apply-Values($v) {
     $script:PrivateProcessNames = $v['PrivateProcessNames']
     foreach ($f in $script:NumFields) { Set-Variable -Name $f.Key -Value ([int]$v[$f.Key]) -Scope Script }
     foreach ($k in $script:BoolFields) { Set-Variable -Name $k -Value ([bool]$v[$k]) -Scope Script }
-    $script:CloseArcAt = $v['CloseArcAt']
+    $script:UseHiddenLogin = [bool]$v['UseHiddenLogin']
     $script:PopupKey = $v['PopupKey']
     $script:PrivatePopupKey = $v['PrivatePopupKey']
     $script:BackgroundImage = $v['BackgroundImage']
@@ -1408,7 +1957,8 @@ function Write-SettingsToIni($v) {
         if ($v[$k]) { $t = '1' }
         if (-not [IniFile]::Put($IniFile, $k, $t)) { $ok = $false }
     }
-    if (-not [IniFile]::Put($IniFile, 'CloseArcAt', [string]$v['CloseArcAt'])) { $ok = $false }
+    $hlt = '0'; if ($v['UseHiddenLogin']) { $hlt = '1' }
+    if (-not [IniFile]::Put($IniFile, 'UseHiddenLogin', $hlt)) { $ok = $false }
     if (-not [IniFile]::Put($IniFile, 'PopupKey', [string]$v['PopupKey'])) { $ok = $false }
     if (-not [IniFile]::Put($IniFile, 'PrivatePopupKey', [string]$v['PrivatePopupKey'])) { $ok = $false }
     if (-not [IniFile]::Put($IniFile, 'BackgroundImage', [string]$v['BackgroundImage'])) { $ok = $false }
@@ -1536,10 +2086,24 @@ function New-SNumRow($parent, [string]$key, [int]$labelX, [int]$labelW, [int]$ed
     [void](New-SLabel $parent $label $labelX $y $labelW 23)
     [void](New-SEdit $parent $key $editX $y $editW $true)
 }
+# which of the three Advanced sub-tabs is showing (only matters while page 1 itself is showing)
+function Show-AdvSub([int]$sub) {
+    $script:AdvSub = if ($sub -eq 1 -or $sub -eq 2) { $sub } else { 0 }
+    foreach ($c in $script:PageAdvShared) { $c.Visible = ($script:AdvSub -eq 0) }
+    foreach ($c in $script:PageAdvHidden) { $c.Visible = ($script:AdvSub -eq 1) }
+    foreach ($c in $script:PageAdvShow) { $c.Visible = ($script:AdvSub -eq 2) }
+    $script:Ui['AdvSubShared'].Checked = ($script:AdvSub -eq 0)
+    $script:Ui['AdvSubHidden'].Checked = ($script:AdvSub -eq 1)
+    $script:Ui['AdvSubShow'].Checked = ($script:AdvSub -eq 2)
+}
 function Show-SettingsPage([int]$page) {
     foreach ($c in $script:PageBasic) { $c.Visible = ($page -eq 0) }
     foreach ($c in $script:PageAdv) { $c.Visible = ($page -eq 1) }
     foreach ($c in $script:PagePriv) { $c.Visible = ($page -eq 2) }
+    $onAdv = ($page -eq 1)
+    foreach ($c in $script:PageAdvShared) { $c.Visible = ($onAdv -and $script:AdvSub -eq 0) }
+    foreach ($c in $script:PageAdvHidden) { $c.Visible = ($onAdv -and $script:AdvSub -eq 1) }
+    foreach ($c in $script:PageAdvShow) { $c.Visible = ($onAdv -and $script:AdvSub -eq 2) }
     $script:Ui['PageBasic'].Checked = ($page -eq 0)
     $script:Ui['PageAdv'].Checked = ($page -eq 1)
     $script:Ui['PagePriv'].Checked = ($page -eq 2)
@@ -1572,7 +2136,7 @@ function Show-Settings {
     $dlg.StartPosition = 'CenterParent'
     $dlg.AutoScaleMode = 'None'
     $dlg.Font = New-Object System.Drawing.Font('Segoe UI', 9.5)
-    $dlg.ClientSize = New-Object System.Drawing.Size(640, 548)
+    $dlg.ClientSize = New-Object System.Drawing.Size(640, 558)
     $dlg.BackColor = [System.Drawing.SystemColors]::Control
     $dlg.ForeColor = [System.Drawing.SystemColors]::ControlText
     $tt = New-Object System.Windows.Forms.ToolTip
@@ -1582,6 +2146,10 @@ function Show-Settings {
     $script:PageBasic.Clear()
     $script:PageAdv.Clear()
     $script:PagePriv.Clear()
+    $script:PageAdvShared.Clear()
+    $script:PageAdvHidden.Clear()
+    $script:PageAdvShow.Clear()
+    $script:AdvSub = 0
     $script:PageList = $null
     $title = New-SLabel $dlg 'CONFIGURATION' 16 8 250 36
     $title.Font = New-Object System.Drawing.Font('Segoe UI', 18, [System.Drawing.FontStyle]::Bold)
@@ -1624,28 +2192,30 @@ function Show-Settings {
     [void](New-SLabel $g 'pixels' 256 128 44 23)
     [void](New-SCheck $g 'RememberWindowSize' 'Remember the size when closing' 28 158 266)
 
-    $g = New-SGroup 'Close Arc when' 16 198 300 82
-    [void](New-SRadio $g 'CloseLauncher' 'The launcher starts' 28 220 266)
-    [void](New-SRadio $g 'CloseGame' 'The game client starts' 28 244 266)
+    $g = New-SGroup 'Launcher Mode' 16 198 300 82
+    [void](New-SRadio $g 'ModeHidden' 'Hidden Arc Mode' 28 220 266)
+    [void](New-SRadio $g 'ModeShow' 'Show Arc Mode' 28 244 266)
 
-    $g = New-SGroup 'Options' 332 106 292 174
+    $g = New-SGroup 'Options' 332 106 292 222
     [void](New-SCheck $g 'DebugLog' 'Debug / Logs' 344 130 270)
     [void](New-SCheck $g 'KillArcOnStart' 'Close running Arc at start / sign-in' 344 154 270)
     [void](New-SCheck $g 'AutoFill' 'Auto-fill username and password' 344 178 270)
-    [void](New-SCheck $g 'RenameGameWindows' 'Rename game windows to Notes' 344 202 270)
-    [void](New-SCheck $g 'ConfirmStop' 'Ask before stopping a game client' 344 226 270)
-    [void](New-SCheck $g 'ShowStorageHint' 'Show plain-text storage notice' 344 250 270)
+    [void](New-SCheck $g 'ClickArcPlay' 'Auto-click Play (arc)' 344 202 270)
+    [void](New-SCheck $g 'ClickPatcherStart' 'Auto-click Start (launcher/patcher)' 344 226 270)
+    [void](New-SCheck $g 'RenameGameWindows' 'Rename game windows to Notes' 344 250 270)
+    [void](New-SCheck $g 'ConfirmStop' 'Ask before stopping a game client' 344 274 270)
+    [void](New-SCheck $g 'ShowStorageHint' 'Show plain-text storage notice' 344 298 270)
 
-    $g = New-SGroup 'Background' 16 288 608 146
-    [void](New-SLabel $g 'Background Image Location' 28 308 300 20)
-    [void](New-SEdit $g 'BackgroundImage' 28 330 496 $false)
-    $b2 = New-SButton 'BrowseBg' 'Browse...' 532 329 80 25
+    $g = New-SGroup 'Background' 16 336 608 146
+    [void](New-SLabel $g 'Background Image Location' 28 332 300 20)
+    [void](New-SEdit $g 'BackgroundImage' 28 354 496 $false)
+    $b2 = New-SButton 'BrowseBg' 'Browse...' 532 353 80 25
     $g.Controls.Add($b2)
-    $b2.SetBounds((532 - $g.Left), (329 - $g.Top), 80, 25)
+    $b2.SetBounds((532 - $g.Left), (353 - $g.Top), 80, 25)
     $b2.Add_Click({ Browse-Into 'BackgroundImage' 'Pictures|*.png;*.jpg;*.jpeg;*.bmp;*.gif|All files|*.*' 'Choose a background image' })
-    [void](New-SLabel $g 'Mode' 28 366 44 20)
-    for ($i = 0; $i -lt 5; $i++) { [void](New-SRadio $g ('Mode' + $i) $script:ModeLabels[$i] (74 + $i * 96) 366 92) }
-    [void](New-SLabel $g 'Darkness' 28 398 62 30)
+    [void](New-SLabel $g 'Mode' 28 390 44 20)
+    for ($i = 0; $i -lt 5; $i++) { [void](New-SRadio $g ('Mode' + $i) $script:ModeLabels[$i] (74 + $i * 96) 390 92) }
+    [void](New-SLabel $g 'Darkness' 28 422 62 30)
     $tb = New-Object System.Windows.Forms.TrackBar
     $tb.Minimum = 0
     $tb.Maximum = 100
@@ -1653,34 +2223,88 @@ function Show-Settings {
     $tb.LargeChange = 10
     $tb.SmallChange = 1
     $tb.Add_ValueChanged({ Update-DimLabel; Set-SDirty })
-    Add-SCtl $g $tb 92 394 420 40
+    Add-SCtl $g $tb 92 418 420 40
     $script:Ui['Dim'] = $tb
-    $dl = New-SLabel $g '50%' 520 398 80 30
+    $dl = New-SLabel $g '50%' 520 422 80 30
     $script:Ui['DimLbl'] = $dl
 
-    # ======== page 2: Advanced (rarely needs changing)
+    # ======== page 2: Advanced - one shared description, then three sub-tabs: Shared Settings (default), Hidden Arc Mode and Show Arc Mode
     $script:PageList = $script:PageAdv
     [void](New-SLabel $dlg 'Timing and fine-tuning. The defaults suit most computers.' 16 108 608 20)
-    $g = New-SGroup 'Signing in' 16 134 300 200
-    $y = 160
+    $sa = New-Object System.Windows.Forms.RadioButton
+    $sa.Text = 'Shared Settings'
+    $sa.Appearance = 'Button'
+    $sa.TextAlign = 'MiddleCenter'
+    Add-SCtl $dlg $sa 16 132 150 24
+    $script:Ui['AdvSubShared'] = $sa
+    $sh = New-Object System.Windows.Forms.RadioButton
+    $sh.Text = 'Hidden Arc Mode'
+    $sh.Appearance = 'Button'
+    $sh.TextAlign = 'MiddleCenter'
+    Add-SCtl $dlg $sh 172 132 150 24
+    $script:Ui['AdvSubHidden'] = $sh
+    $ss = New-Object System.Windows.Forms.RadioButton
+    $ss.Text = 'Show Arc Mode'
+    $ss.Appearance = 'Button'
+    $ss.TextAlign = 'MiddleCenter'
+    Add-SCtl $dlg $ss 328 132 150 24
+    $script:Ui['AdvSubShow'] = $ss
+    $sa.Add_Click({ Show-AdvSub 0 })
+    $sh.Add_Click({ Show-AdvSub 1 })
+    $ss.Add_Click({ Show-AdvSub 2 })
+
+    # ---- Advanced / Shared Settings sub-tab (used by both Launcher Modes)
+    $script:PageList = $script:PageAdvShared
+    $g = New-SGroup 'Game clients and windows' 16 164 300 140
+    $y = 192
+    foreach ($k in @('PendingTimeoutSeconds', 'RenameDurationSeconds', 'StatusResetSeconds')) {
+        New-SNumRow $g $k 28 205 240 58 $y
+        $y += 30
+    }
+    $g = New-SGroup 'Clicking Start (launcher / patcher)' 332 164 292 100
+    $y = 192
+    foreach ($k in @('PatcherStartPollIntervalMs', 'PatcherStartTimeoutSeconds')) {
+        New-SNumRow $g $k 344 210 556 56 $y
+        $y += 30
+    }
+
+    # ---- Advanced / Show Arc Mode sub-tab (the old visible pop-up method's timing)
+    $script:PageList = $script:PageAdvShow
+    $g = New-SGroup 'Signing in' 16 164 300 200
+    $y = 190
     foreach ($k in @('UsernameFocusTabs', 'FieldSeparatorTabs', 'LoginDelayMs', 'MinWaitSeconds', 'WindowTimeoutSeconds')) {
         New-SNumRow $g $k 28 205 240 58 $y
         $y += 30
     }
-    $g = New-SGroup 'Closing Arc and other' 332 134 292 200
-    $y = 160
-    foreach ($k in @('LauncherGraceSeconds', 'GraceSeconds', 'TimeoutSeconds', 'PendingTimeoutSeconds', 'RenameDurationSeconds', 'StatusResetSeconds')) {
-        New-SNumRow $g $k 344 210 556 56 $y
-        $y += 28
+    $g = New-SGroup 'Waiting for the game' 332 164 292 62
+    New-SNumRow $g 'TimeoutSeconds' 344 210 556 56 190
+    $g = New-SGroup 'Login pop-up and typing' 16 372 608 104
+    New-SNumRow $g 'EntersBefore' 28 235 270 50 396
+    [void](New-SLabel $g 'Key for the pop-up' 28 422 120 23)
+    [void](New-SRadio $g 'PopEnter' 'Enter' 160 422 70)
+    [void](New-SRadio $g 'PopEsc' 'Escape' 240 422 72)
+    New-SNumRow $g 'PauseAfterPopupMs' 28 235 270 50 448
+    New-SNumRow $g 'ClearBackspaces' 344 210 566 50 396
+    [void](New-SCheck $g 'EnterAfterPassword' 'Press Enter after the password' 344 424 270)
+
+    # ---- Advanced / Hidden Arc Mode sub-tab (the hidden sign-in's timing)
+    $script:PageList = $script:PageAdvHidden
+    $g = New-SGroup 'Signing in (hidden)' 16 164 300 212
+    $y = 188
+    foreach ($k in @('HiddenKeyDelayMs', 'HiddenCharDelayMs', 'HiddenPostTabDelayMs', 'HiddenPostFieldDelayMs', 'HiddenHideSettleDelayMs', 'HiddenSignInTimeoutSeconds', 'HiddenSignInPollIntervalMs')) {
+        New-SNumRow $g $k 28 205 240 58 $y
+        $y += 24
     }
-    $g = New-SGroup 'Login pop-up and typing' 16 342 608 104
-    New-SNumRow $g 'EntersBefore' 28 235 270 50 366
-    [void](New-SLabel $g 'Key for the pop-up' 28 392 120 23)
-    [void](New-SRadio $g 'PopEnter' 'Enter' 160 392 70)
-    [void](New-SRadio $g 'PopEsc' 'Escape' 240 392 72)
-    New-SNumRow $g 'PauseAfterPopupMs' 28 235 270 50 418
-    New-SNumRow $g 'ClearBackspaces' 344 210 566 50 366
-    [void](New-SCheck $g 'EnterAfterPassword' 'Press Enter after the password' 344 394 270)
+    $g = New-SGroup 'After sign-in (clicking Play)' 332 164 292 100
+    $y = 190
+    foreach ($k in @('HiddenMainWindowInitialDelayMs', 'HiddenMainWindowTimeoutSeconds', 'HiddenMainWindowPollIntervalMs')) {
+        New-SNumRow $g $k 344 210 556 56 $y
+        $y += 26
+    }
+    $g = New-SGroup 'Waiting for the launcher / patcher' 332 276 292 80
+    New-SNumRow $g 'HiddenPatcherWaitTimeoutSeconds' 344 210 556 56 302
+    New-SNumRow $g 'HiddenPatcherWaitPollIntervalMs' 344 210 556 56 330
+
     # ======== page 3: Private Servers
     $script:PageList = $script:PagePriv
     [void](New-SLabel $dlg 'Used while the switch at the top of the main window is set to Private Servers. Arc is not used in that mode.' 16 108 608 20)
@@ -1710,13 +2334,14 @@ function Show-Settings {
         $y += 26
     }
     [void](New-SCheck $dlg 'PrivateShowWarning' 'Show a warning when switching to Private Servers' 150 452 340)
+
     $script:PageList = $null
 
     # ======== buttons (always visible)
-    $bd = New-SButton 'Defaults' 'LOAD DEFAULTS' 16 480 130 28
-    $bf = New-SButton 'Folder' 'OPEN SETTINGS FOLDER' 154 480 176 28
-    $bs = New-SButton 'Save' 'SAVE CONFIGURATION' 338 480 184 28
-    $bc = New-SButton 'Cancel' 'CANCEL' 530 480 94 28
+    $bd = New-SButton 'Defaults' 'LOAD DEFAULTS' 16 490 130 28
+    $bf = New-SButton 'Folder' 'OPEN SETTINGS FOLDER' 154 490 176 28
+    $bs = New-SButton 'Save' 'SAVE CONFIGURATION' 338 490 184 28
+    $bc = New-SButton 'Cancel' 'CANCEL' 530 490 94 28
     $bc.DialogResult = 'Cancel'
     $dlg.AcceptButton = $bs
     $dlg.CancelButton = $bc
@@ -1727,9 +2352,9 @@ function Show-Settings {
     })
     $bf.Add_Click({ [void][System.Diagnostics.Process]::Start($ConfigDir) })
     $bs.Add_Click({ Save-Settings })
-    $info = New-SLabel $dlg ('Settings file: ' + $IniFile) 16 520 440 20
+    $info = New-SLabel $dlg ('Settings file: ' + $IniFile) 16 530 440 20
     $info.AutoEllipsis = $true
-    $ver = New-SLabel $dlg (([string][char]169) + ' 2026 Sparc343') 464 520 160 20
+    $ver = New-SLabel $dlg (([string][char]169) + ' 2026 Sparc343') 464 530 160 20
     $ver.TextAlign = 'MiddleRight'
 
     # hover hints
@@ -1737,6 +2362,27 @@ function Show-Settings {
         PageBasic = 'The settings most people use.'
         PageAdv = 'Timing and fine-tuning. The defaults suit most computers.'
         PagePriv = 'Settings for private servers (game servers that do not use Arc).'
+        ModeHidden = "Hides Arc's window throughout the login process (it may flicker very briefly on your screen). The game's launcher / patcher window is hidden too."
+        ModeShow = "Shows Arc's window and uses the old pop-up/auto-fill method to sign in."
+        AdvSubShared = 'Settings used by both Hidden Arc Mode and Show Arc Mode.'
+        AdvSubHidden = 'Timing for the hidden sign-in method (Hidden Arc Mode).'
+        AdvSubShow = 'Timing for the old visible pop-up method (Show Arc Mode).'
+        HiddenKeyDelayMs = 'How long each simulated key press is held down, in milliseconds.'
+        HiddenCharDelayMs = 'Pause between typed characters, in milliseconds.'
+        HiddenPostTabDelayMs = 'Pause after moving to the next box with Tab, in milliseconds.'
+        HiddenPostFieldDelayMs = 'Pause after finishing a box (username or password), in milliseconds.'
+        HiddenHideSettleDelayMs = "Pause right after hiding Arc's Sign In window, before typing begins."
+        HiddenSignInTimeoutSeconds = "Give up if Arc's Sign In window has not appeared after this many seconds."
+        HiddenSignInPollIntervalMs = "How often to check whether Arc's Sign In window has appeared, in milliseconds."
+        HiddenMainWindowInitialDelayMs = "After pressing Enter on the password, wait this long before looking for Arc's main window."
+        HiddenMainWindowTimeoutSeconds = "Give up if Arc's main window (where Play is clicked) has not appeared after this many seconds."
+        HiddenMainWindowPollIntervalMs = "How often to check for Arc's main window, in milliseconds."
+        HiddenPatcherWaitTimeoutSeconds = 'How long to watch for the launcher / patcher after clicking Play (for the log only; 0 skips this wait).'
+        HiddenPatcherWaitPollIntervalMs = 'How often to check for the launcher / patcher, in milliseconds.'
+        ClickArcPlay = "Show Arc Mode only: once auto-fill submits your username and password, automatically click Arc's own Play button too, instead of clicking it yourself. Hidden Arc Mode always does this."
+        ClickPatcherStart = "Show Arc Mode only: once the launcher/patcher shows up, automatically click its Start button so the game client opens on its own. Hidden Arc Mode always does this (its launcher/patcher window is hidden)."
+        PatcherStartPollIntervalMs = 'How often to click Start while waiting for the launcher/patcher to finish updating and launch the game. Applies to both Launcher Modes.'
+        PatcherStartTimeoutSeconds = 'Give up clicking Start after this many seconds. Applies to both Launcher Modes.'
         PrivateClientPath = 'The game client (elementclient.exe) or the launcher / patcher of the private server. It is started with administrator rights.'
         PrivateFlags = 'Command-line flags, passed exactly as typed. Never put your password here.'
         PrivateShowWarning = 'Show a warning every time you switch the main window to Private Servers.'
@@ -1768,10 +2414,6 @@ function Show-Settings {
         LoginDelayMs = "How long Arc's login window must be showing before typing starts (1000 = 1 second)."
         MinWaitSeconds = 'Never type sooner than this after starting Arc (skips update pop-ups).'
         WindowTimeoutSeconds = "Give up looking for Arc's login window after this many seconds."
-        CloseLauncher = 'Close this Arc as soon as it starts the game launcher (launcher.exe).'
-        CloseGame = 'Wait until the game client (elementclient.exe) is running before closing Arc.'
-        LauncherGraceSeconds = 'Seconds to wait after the launcher appears before closing Arc.'
-        GraceSeconds = 'Seconds to wait after the game client appears before closing Arc.'
         TimeoutSeconds = 'Give up waiting for a game client after this many seconds.'
         PendingTimeoutSeconds = 'After Arc has been closed early, how long to keep watching for its game client.'
         ConfirmStop = 'Ask for confirmation before the STOP button force-closes a game client.'
@@ -1794,6 +2436,7 @@ function Show-Settings {
     $v['WindowHeight'] = $rs.Height
     $script:SetBuilt = $true
     Set-UiFromValues $v
+    Show-AdvSub 0
     Show-SettingsPage 0
     $script:SetDirty = $false
 
@@ -1914,7 +2557,7 @@ function Build-LogReport([string]$shown, [bool]$previous) {
     if (Test-Path -LiteralPath $ArcPath) { $found = 'yes' }
     $r += 'Arc.exe found: ' + $found + '   running as administrator: ' + $script:IsAdmin + "`r`n"
     $r += 'Settings: '
-    foreach ($k in @('AutoFill', 'UsernameFocusTabs', 'FieldSeparatorTabs', 'LoginDelayMs', 'MinWaitSeconds', 'WindowTimeoutSeconds', 'CloseArcAt', 'LauncherGraceSeconds', 'GraceSeconds', 'TimeoutSeconds', 'PendingTimeoutSeconds', 'KillArcOnStart', 'RenameGameWindows', 'RenameDurationSeconds', 'StatusResetSeconds')) {
+    foreach ($k in @('AutoFill', 'UsernameFocusTabs', 'FieldSeparatorTabs', 'LoginDelayMs', 'MinWaitSeconds', 'WindowTimeoutSeconds', 'TimeoutSeconds', 'PendingTimeoutSeconds', 'KillArcOnStart', 'RenameGameWindows', 'RenameDurationSeconds', 'StatusResetSeconds')) {
         $val = Get-Variable -Name $k -Scope Script -ValueOnly
         if ($val -is [bool]) { $val = [int]$val }
         $r += $k + '=' + $val + '  '
@@ -2090,32 +2733,30 @@ function Guard-TextBox($box) {
 # ---- the minus button of a row (grey, red when hovered; red with a ring when selected)
 $script:DelTipText = "CLICK to delete (with confirmation)`nSHIFT+CLICK to delete (without confirmation)`nCONTROL+CLICK to select several rows to delete,`n      then ALT+D to delete them`nBlank entries are also deleted on exit"
 $script:HotDel = $null
-function Paint-Arrow($btn, $e, [bool]$isUp) {
+$script:GripTipText = "DRAG up or down to move this account to a new place`n(ESC while dragging cancels)`nOr press ALT+UP / ALT+DOWN while the cursor is in`n      any box of this row to move it one place"
+# the drag handle of a row: three lines (grey, blue when hovered or dragged)
+function Paint-Grip($btn, $e) {
     $g = $e.Graphics
     $w = $btn.ClientSize.Width
     $h = $btn.ClientSize.Height
     $disabled = (-not $btn.Enabled)
-    $hot = ([object]::ReferenceEquals($script:HotDel, $btn)) -and (-not $disabled)
-    $fill = [System.Drawing.Color]::FromArgb(128, 128, 138)
-    if ($hot) { $fill = [System.Drawing.Color]::FromArgb(70, 125, 205) }
-    if ($disabled) { $fill = [System.Drawing.Color]::FromArgb(72, 72, 80) }
-    $tri = [System.Drawing.Color]::White
-    if ($disabled) { $tri = [System.Drawing.Color]::FromArgb(112, 112, 120) }
+    $dragging = ($script:Drag -ne $null) -and [object]::ReferenceEquals($script:Drag.Grip, $btn)
+    $hot = (([object]::ReferenceEquals($script:HotDel, $btn)) -or $dragging) -and (-not $disabled)
+    $col = [System.Drawing.Color]::FromArgb(128, 128, 138)
+    if ($hot) { $col = [System.Drawing.Color]::FromArgb(70, 125, 205) }
+    if ($disabled) { $col = [System.Drawing.Color]::FromArgb(72, 72, 80) }
     $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
     $g.Clear($cBox)
     $cx = $w / 2.0
     $cy = $h / 2.0
     $rad = [math]::Min($w, $h) * 0.40
-    $fillBrush = New-Object System.Drawing.SolidBrush($fill)
-    $g.FillEllipse($fillBrush, [single]($cx - $rad), [single]($cy - $rad), [single](2 * $rad), [single](2 * $rad))
-    $t = $rad * 0.52
-    $dir = 1
-    if ($isUp) { $dir = -1 }
-    $pts = [System.Drawing.PointF[]]@((New-PtF $cx ($cy + $dir * $t)), (New-PtF ($cx - $t) ($cy - $dir * $t * 0.6)), (New-PtF ($cx + $t) ($cy - $dir * $t * 0.6)))
-    $triBrush = New-Object System.Drawing.SolidBrush($tri)
-    $g.FillPolygon($triBrush, $pts)
-    $fillBrush.Dispose()
-    $triBrush.Dispose()
+    $hw = $rad * 0.85
+    $gap = $rad * 0.62
+    $brush = New-Object System.Drawing.SolidBrush($col)
+    foreach ($k in -1, 0, 1) {
+        $g.FillRectangle($brush, [single]($cx - $hw), [single]($cy + $k * $gap - 1), [single](2 * $hw), [single]2)
+    }
+    $brush.Dispose()
 }
 function Paint-Minus($btn, $e) {
     $row = $btn.Tag
@@ -2149,7 +2790,7 @@ function Paint-Minus($btn, $e) {
 }
 # the status text is as wide as the window allows; it must never reach past the edge (that gives a horizontal scroll bar)
 function Update-StatusWidths {
-    $w = [math]::Max(40, ($panel.ClientSize.Width - 927 - 12))   # (40 is small enough to fit even at the smallest window size)
+    $w = [math]::Max(40, ($panel.ClientSize.Width - 901 - 12))   # (40 is small enough to fit even at the smallest window size)
     foreach ($r in $script:Rows) { if ($r.Label.Width -ne $w) { $r.Label.Width = $w } }
 }
 # after the whole list was replaced (or the window was shown) the panel can keep an old "needs a horizontal scroll bar" state:
@@ -2165,7 +2806,7 @@ function Add-Row([string]$user, [string]$pass, [string]$notes) {
     $y = 8 + ($script:Rows.Count * 40) + $panel.AutoScrollPosition.Y   # (AutoScrollPosition.Y is 0 or negative: positions inside a scrolled panel are relative to what is shown)
 
     $tb = New-Object System.Windows.Forms.TextBox
-    $tb.Location = New-Object System.Drawing.Point(92, $y)
+    $tb.Location = New-Object System.Drawing.Point(66, $y)
     $tb.Size = New-Object System.Drawing.Size(195, 26)
     $tb.Text = $user
     $tb.BackColor = $cBox
@@ -2173,7 +2814,7 @@ function Add-Row([string]$user, [string]$pass, [string]$notes) {
     $tb.BorderStyle = 'FixedSingle'
 
     $pw = New-Object System.Windows.Forms.TextBox
-    $pw.Location = New-Object System.Drawing.Point(299, $y)
+    $pw.Location = New-Object System.Drawing.Point(273, $y)
     $pw.Size = New-Object System.Drawing.Size(195, 26)
     $pw.Text = $pass
     $pw.UseSystemPasswordChar = $true
@@ -2182,7 +2823,7 @@ function Add-Row([string]$user, [string]$pass, [string]$notes) {
     $pw.BorderStyle = 'FixedSingle'
 
     $nt = New-Object System.Windows.Forms.TextBox
-    $nt.Location = New-Object System.Drawing.Point(506, $y)
+    $nt.Location = New-Object System.Drawing.Point(480, $y)
     $nt.Size = New-Object System.Drawing.Size(195, 26)
     $nt.Text = $notes
     $nt.BackColor = $cBox
@@ -2202,7 +2843,7 @@ function Add-Row([string]$user, [string]$pass, [string]$notes) {
     Guard-TextBox $nt
 
     $btn = New-Object System.Windows.Forms.Button
-    $btn.Location = New-Object System.Drawing.Point(713, ($y - 1))
+    $btn.Location = New-Object System.Drawing.Point(687, ($y - 1))
     $btn.Size = New-Object System.Drawing.Size(122, 28)
     $btn.Text = 'SIGN IN'
     $btn.FlatStyle = 'Flat'
@@ -2212,7 +2853,7 @@ function Add-Row([string]$user, [string]$pass, [string]$notes) {
     $btn.Font = New-Object System.Drawing.Font('Segoe UI', 9.5, [System.Drawing.FontStyle]::Bold)
 
     $stop = New-Object System.Windows.Forms.Button
-    $stop.Location = New-Object System.Drawing.Point(843, ($y - 1))
+    $stop.Location = New-Object System.Drawing.Point(817, ($y - 1))
     $stop.Size = New-Object System.Drawing.Size(76, 28)
     $stop.Text = 'STOP'
     $stop.Enabled = $false
@@ -2223,8 +2864,8 @@ function Add-Row([string]$user, [string]$pass, [string]$notes) {
     $stop.Font = New-Object System.Drawing.Font('Segoe UI', 9.5, [System.Drawing.FontStyle]::Bold)
 
     $lbl = New-Object System.Windows.Forms.Label
-    $lbl.Location = New-Object System.Drawing.Point(927, ($y + 4))
-    $lbl.Size = New-Object System.Drawing.Size([math]::Max(40, ($panel.ClientSize.Width - 927 - 12)), 22)   # as wide as the window allows (never wider: that gave a scroll bar)
+    $lbl.Location = New-Object System.Drawing.Point(901, ($y + 4))
+    $lbl.Size = New-Object System.Drawing.Size([math]::Max(40, ($panel.ClientSize.Width - 901 - 12)), 22)   # as wide as the window allows (never wider: that gave a scroll bar)
     $lbl.AutoEllipsis = $true
     $lbl.Text = 'Idle'
     $lbl.BackColor = [System.Drawing.Color]::Transparent
@@ -2243,37 +2884,33 @@ function Add-Row([string]$user, [string]$pass, [string]$notes) {
     $del.Add_Click({ param($s, $e) Delete-Click $s.Tag })
     if ($script:TipMain -ne $null) { $script:TipMain.SetToolTip($del, $script:DelTipText) }
 
-    $up = New-Object System.Windows.Forms.Button
-    $down = New-Object System.Windows.Forms.Button
-    foreach ($ab in @($up, $down)) {
-        $ab.Size = New-Object System.Drawing.Size(24, 24)
-        $ab.FlatStyle = 'Flat'
-        $ab.FlatAppearance.BorderSize = 0
-        $ab.BackColor = $cBox
-        $ab.TabStop = $false
-        $ab.Add_MouseEnter({ param($s, $e) $script:HotDel = $s; $s.Invalidate() })
-        $ab.Add_MouseLeave({ param($s, $e) if ([object]::ReferenceEquals($script:HotDel, $s)) { $script:HotDel = $null }; $s.Invalidate() })
-    }
-    $up.Location = New-Object System.Drawing.Point(8, ($y + 1))
-    $down.Location = New-Object System.Drawing.Point(60, ($y + 1))
-    $up.Add_Paint({ param($s, $e) Paint-Arrow $s $e $true })
-    $down.Add_Paint({ param($s, $e) Paint-Arrow $s $e $false })
-    $up.Add_Click({ param($s, $e) Move-Row $s.Tag -1 })
-    $down.Add_Click({ param($s, $e) Move-Row $s.Tag 1 })
-    if ($script:TipMain -ne $null) { $script:TipMain.SetToolTip($up, 'Move this account up'); $script:TipMain.SetToolTip($down, 'Move this account down') }
+    $grip = New-Object System.Windows.Forms.Button
+    $grip.Size = New-Object System.Drawing.Size(24, 24)
+    $grip.Location = New-Object System.Drawing.Point(8, ($y + 1))
+    $grip.FlatStyle = 'Flat'
+    $grip.FlatAppearance.BorderSize = 0
+    $grip.BackColor = $cBox
+    $grip.TabStop = $false
+    $grip.Cursor = [System.Windows.Forms.Cursors]::SizeAll
+    $grip.Add_Paint({ param($s, $e) Paint-Grip $s $e })
+    $grip.Add_MouseEnter({ param($s, $e) $script:HotDel = $s; $s.Invalidate() })
+    $grip.Add_MouseLeave({ param($s, $e) if ([object]::ReferenceEquals($script:HotDel, $s)) { $script:HotDel = $null }; $s.Invalidate() })
+    $grip.Add_MouseDown({ param($s, $e) if ($e.Button -eq [System.Windows.Forms.MouseButtons]::Left) { Start-Drag $s } })
+    $grip.Add_MouseMove({ param($s, $e) Update-Drag })
+    $grip.Add_MouseUp({ param($s, $e) if ($e.Button -eq [System.Windows.Forms.MouseButtons]::Left) { End-Drag $true } })
+    $grip.Add_MouseCaptureChanged({ param($s, $e) End-Drag $false })   # e.g. Alt+Tab or a pop-up window appeared: cancel quietly
+    if ($script:TipMain -ne $null) { $script:TipMain.SetToolTip($grip, $script:GripTipText) }
 
-    $row = @{ Up = $up; Down = $down; Del = $del; Selected = $false; Box = $tb; Pass = $pw; Notes = $nt; Button = $btn; Stop = $stop; Label = $lbl; GamePid = $null; Pending = $null; GameStart = $null; GameStartPid = $null; Title = ''; TitlePid = $null; TitleSeen = $null; TitleLogs = 0; StatusSince = $null; StatusTransient = $false }
+    $row = @{ Grip = $grip; Del = $del; Selected = $false; Box = $tb; Pass = $pw; Notes = $nt; Button = $btn; Stop = $stop; Label = $lbl; GamePid = $null; Pending = $null; GameStart = $null; GameStartPid = $null; Title = ''; TitlePid = $null; TitleSeen = $null; TitleLogs = 0; StatusSince = $null; StatusTransient = $false }
     $btn.Tag = $row
     $del.Tag = $row
-    $up.Tag = $row
-    $down.Tag = $row
+    $grip.Tag = $row
     $stop.Tag = $row
     $stop.Add_Click({ param($s, $e) Stop-Client $s.Tag })
     $btn.Add_Click({ param($s, $e) Start-Play $s.Tag })
 
     $panel.Controls.Add($del)
-    $panel.Controls.Add($up)
-    $panel.Controls.Add($down)
+    $panel.Controls.Add($grip)
     $panel.Controls.Add($tb)
     $panel.Controls.Add($pw)
     $panel.Controls.Add($nt)
@@ -2303,18 +2940,15 @@ function Update-DeleteButtons {
             if ((-not $ok) -and $r.Selected) { $r.Selected = $false }
             $r.Del.Invalidate()
         }
-        $idx = $script:Rows.IndexOf($r)   # moving rows is only blocked while a sign-in runs
-        $upOk = (($script:Active -eq $null) -and ($idx -gt 0))
-        $downOk = (($script:Active -eq $null) -and ($idx -lt ($script:Rows.Count - 1)))
-        if ($r.Up.Enabled -ne $upOk) { $r.Up.Enabled = $upOk; $r.Up.Invalidate() }
-        if ($r.Down.Enabled -ne $downOk) { $r.Down.Enabled = $downOk; $r.Down.Invalidate() }
+        $gripOk = (($script:Active -eq $null) -and ($script:Rows.Count -gt 1))   # moving rows is only blocked while a sign-in runs (or when there is just one row)
+        if ($r.Grip.Enabled -ne $gripOk) { $r.Grip.Enabled = $gripOk; $r.Grip.Invalidate() }
     }
     Update-SelectionHint
 }
 function Remove-Row($r) {
     if ($script:TipMain -ne $null) { $script:TipMain.SetToolTip($r.Del, '') }
     if ([object]::ReferenceEquals($script:HotDel, $r.Del)) { $script:HotDel = $null }
-    foreach ($c in @($r.Box, $r.Pass, $r.Notes, $r.Button, $r.Stop, $r.Label, $r.Del, $r.Up, $r.Down)) { $panel.Controls.Remove($c); $c.Dispose() }
+    foreach ($c in @($r.Box, $r.Pass, $r.Notes, $r.Button, $r.Stop, $r.Label, $r.Del, $r.Grip)) { $panel.Controls.Remove($c); $c.Dispose() }
     $script:Rows.Remove($r)
 }
 function Relayout-Rows {
@@ -2328,8 +2962,7 @@ function Relayout-Rows {
         $r.Stop.Top = $y - 1
         $r.Label.Top = $y + 4
         $r.Del.Top = $y + 1
-        $r.Up.Top = $y + 1
-        $r.Down.Top = $y + 1
+        $r.Grip.Top = $y + 1
         $i++
     }
 }
@@ -2347,18 +2980,16 @@ function Get-RowLabel($r) {
     if ($n -eq '') { return $u }
     return ($u + '  (' + $n + ')')
 }
-# moves a row up (-1) or down (+1); the whole row (texts, running client, status) moves with it
-function Move-Row($r, [int]$dir) {
+# moves a row to place $to (any distance); the whole row (texts, running client, status) moves with it
+function Move-RowTo($r, [int]$to) {
+    $from = $script:Rows.IndexOf($r)
+    if ($from -lt 0 -or $to -lt 0 -or $to -ge $script:Rows.Count -or $from -eq $to) { return }
     if ($script:Active -ne $null) {
         [void][System.Windows.Forms.MessageBox]::Show($form, 'A sign-in is in progress. Wait for it to finish, or cancel it first.', 'Cannot move now', 'OK', 'Information')
         return
     }
-    $i = $script:Rows.IndexOf($r)
-    $j = $i + $dir
-    if ($i -lt 0 -or $j -lt 0 -or $j -ge $script:Rows.Count) { return }
-    $tmp = $script:Rows[$i]
-    $script:Rows[$i] = $script:Rows[$j]
-    $script:Rows[$j] = $tmp
+    $script:Rows.RemoveAt($from)
+    $script:Rows.Insert($to, $r)
     Relayout-Rows
     $t = 0   # keep the Tab order the same as the order on screen
     foreach ($x in $script:Rows) { foreach ($c in @($x.Box, $x.Pass, $x.Notes, $x.Button, $x.Stop)) { $c.TabIndex = $t; $t++ } }
@@ -2366,6 +2997,78 @@ function Move-Row($r, [int]$dir) {
     Save-Session
     Update-DeleteButtons
 }
+# moves a row one place up (-1) or down (+1), used by ALT+UP / ALT+DOWN
+function Move-Row($r, [int]$dir) {
+    $i = $script:Rows.IndexOf($r)
+    if ($i -lt 0) { return }
+    Move-RowTo $r ($i + $dir)
+}
+# ---- dragging a row by its grip: the blue line shows where the row would land; ESC or Alt+Tab cancels
+$script:Drag = $null
+$script:DragLine = $null
+$script:DragTimer = New-Object System.Windows.Forms.Timer
+$script:DragTimer.Interval = 40   # keeps the list scrolling while the mouse rests near its top / bottom edge
+function Show-DragLine {
+    if ($script:DragLine -eq $null) {
+        $script:DragLine = New-Object System.Windows.Forms.Label
+        $script:DragLine.AutoSize = $false
+        $script:DragLine.Height = 3
+        $script:DragLine.BackColor = [System.Drawing.Color]::FromArgb(70, 125, 205)
+        $script:DragLine.Visible = $false
+        $panel.Controls.Add($script:DragLine)
+    }
+    $d = $script:Drag
+    if (($d -eq $null) -or ($d.Target -eq $d.From)) { $script:DragLine.Visible = $false; return }
+    $edge = 8 + ($d.Target + $(if ($d.Target -gt $d.From) { 1 } else { 0 })) * 40 + $panel.AutoScrollPosition.Y   # top of the row after the line
+    $script:DragLine.Left = 4
+    $script:DragLine.Width = [math]::Max(8, ($panel.ClientSize.Width - 8))
+    $script:DragLine.Top = [math]::Max(0, ($edge - 7))
+    $script:DragLine.Visible = $true
+    $script:DragLine.BringToFront()
+}
+function Update-Drag {
+    if ($script:Drag -eq $null) { return }
+    $p = $panel.PointToClient([System.Windows.Forms.Cursor]::Position)
+    $ch = $panel.ClientSize.Height
+    $step = 0
+    if ($p.Y -lt 28) { $step = -([math]::Min(28 - $p.Y, 56) / 4 + 4) }
+    elseif ($p.Y -gt ($ch - 28)) { $step = [math]::Min($p.Y - ($ch - 28), 56) / 4 + 4 }
+    if ($step -ne 0) {
+        $cur = - $panel.AutoScrollPosition.Y
+        $panel.AutoScrollPosition = New-Object System.Drawing.Point((- $panel.AutoScrollPosition.X), [int][math]::Max(0, $cur + $step))
+        # while the list scrolls, the timer keeps the message queue busy and the rows were never painted: paint everything right now
+        [WinHelper]::RedrawNow($panel.Handle)
+        $p = $panel.PointToClient([System.Windows.Forms.Cursor]::Position)
+    }
+    $n = $script:Rows.Count
+    $t = [int][math]::Floor(($p.Y - $panel.AutoScrollPosition.Y - 8) / 40)
+    $t = [math]::Max(0, [math]::Min($t, $n - 1))
+    if ($t -ne $script:Drag.Target) { $script:Drag.Target = $t }
+    Show-DragLine
+}
+function Start-Drag($grip) {
+    if (($script:Drag -ne $null) -or (-not $grip.Enabled)) { return }
+    $r = $grip.Tag
+    $i = $script:Rows.IndexOf($r)
+    if ($i -lt 0) { return }
+    $script:Drag = @{ Row = $r; From = $i; Target = $i; Grip = $grip }
+    $grip.Capture = $true
+    $script:DragTimer.Start()
+    $grip.Invalidate()
+}
+function End-Drag([bool]$drop) {
+    $d = $script:Drag
+    if ($d -eq $null) { return }
+    if ($drop) { Update-Drag }
+    $script:Drag = $null   # (cleared first: releasing the mouse capture raises the capture-changed event)
+    $script:DragTimer.Stop()
+    if ($script:DragLine -ne $null) { $script:DragLine.Visible = $false }
+    if ($d.Grip.Capture) { $d.Grip.Capture = $false }
+    $d.Grip.Invalidate()
+    $panel.Invalidate($true)
+    if ($drop -and ($d.Target -ne $d.From)) { Move-RowTo $d.Row $d.Target }
+}
+$script:DragTimer.Add_Tick({ Update-Drag })
 function Delete-Click($r) {
     $mods = [System.Windows.Forms.Control]::ModifierKeys
     $shift = (($mods -band [System.Windows.Forms.Keys]::Shift) -eq [System.Windows.Forms.Keys]::Shift)
@@ -2470,7 +3173,7 @@ function Set-PrivateMode([bool]$on) {
     Apply-ModePaths
     $script:LastSession = ''
     foreach ($r in @($script:Rows)) {
-        foreach ($c in @($r.Box, $r.Pass, $r.Notes, $r.Button, $r.Stop, $r.Label, $r.Del, $r.Up, $r.Down)) { $panel.Controls.Remove($c); $c.Dispose() }
+        foreach ($c in @($r.Box, $r.Pass, $r.Notes, $r.Button, $r.Stop, $r.Label, $r.Del, $r.Grip)) { $panel.Controls.Remove($c); $c.Dispose() }
     }
     $script:Rows.Clear()
     Update-SelectionHint
@@ -2684,8 +3387,7 @@ $script:TipMain = New-Object System.Windows.Forms.ToolTip
 $script:TipMain.SetToolTip($gearBtn, 'Settings')
 foreach ($r in $script:Rows) {
     $script:TipMain.SetToolTip($r.Del, $script:DelTipText)
-    $script:TipMain.SetToolTip($r.Up, 'Move this account up')
-    $script:TipMain.SetToolTip($r.Down, 'Move this account down')
+    $script:TipMain.SetToolTip($r.Grip, $script:GripTipText)
 }
 $script:TipMain.SetToolTip($modeBtn, 'OFFICIAL Servers = the game through Arc. PRIVATE Servers = private servers (no Arc). Each mode has its own account list. Click to switch.')
 $script:TipMain.SetToolTip($logBtn, 'View log')
@@ -2696,6 +3398,11 @@ $script:PrivTimer = New-Object System.Windows.Forms.Timer   # runs the private-s
 $script:PrivTimer.Interval = 100
 $script:PrivTimer.Add_Tick({ Private-Tick })
 Update-ModeUi
+
+$script:ToolHideTimer = New-Object System.Windows.Forms.Timer   # keeps the launcher/patcher off-screen in Hidden Arc Mode
+$script:ToolHideTimer.Interval = 100
+$script:ToolHideTimer.Add_Tick({ Hide-LaunchToolWindows })
+$script:ToolHideTimer.Start()
 
 $timer = New-Object System.Windows.Forms.Timer
 $timer.Interval = 1000
@@ -2710,7 +3417,22 @@ $form.Add_SizeChanged({
 $form.KeyPreview = $true
 $form.Add_KeyDown({
     param($s, $e)
-    if ($e.Alt -and $e.KeyCode -eq [System.Windows.Forms.Keys]::D) { Delete-Selected; $e.Handled = $true; $e.SuppressKeyPress = $true }   # ALT+D
+    if (($script:Drag -ne $null) -and $e.KeyCode -eq [System.Windows.Forms.Keys]::Escape) { End-Drag $false; $e.Handled = $true; $e.SuppressKeyPress = $true }   # ESC cancels a drag
+    elseif ($e.Alt -and $e.KeyCode -eq [System.Windows.Forms.Keys]::D) { Delete-Selected; $e.Handled = $true; $e.SuppressKeyPress = $true }   # ALT+D
+    elseif ($e.Alt -and ($e.KeyCode -eq [System.Windows.Forms.Keys]::Up -or $e.KeyCode -eq [System.Windows.Forms.Keys]::Down) -and ($script:Drag -eq $null)) {   # ALT+UP / ALT+DOWN: move the row that has the cursor
+        $c = $form.ActiveControl
+        while (($c -is [System.Windows.Forms.ContainerControl]) -and ($c.ActiveControl -ne $null)) { $c = $c.ActiveControl }
+        $mine = $null
+        foreach ($r in $script:Rows) { if (([object]::ReferenceEquals($r.Box, $c)) -or ([object]::ReferenceEquals($r.Pass, $c)) -or ([object]::ReferenceEquals($r.Notes, $c)) -or ([object]::ReferenceEquals($r.Button, $c)) -or ([object]::ReferenceEquals($r.Stop, $c))) { $mine = $r } }
+        if ($mine -ne $null) {
+            $dir = 1
+            if ($e.KeyCode -eq [System.Windows.Forms.Keys]::Up) { $dir = -1 }
+            Move-Row $mine $dir
+            $panel.ScrollControlIntoView($c)   # follow the row when it moved out of sight
+            $c.Focus()
+        }
+        $e.Handled = $true; $e.SuppressKeyPress = $true
+    }
     elseif ($e.KeyCode -eq [System.Windows.Forms.Keys]::Escape -and (Get-SelectedCount) -gt 0) { Clear-Selection; $e.Handled = $true }
 })
 # Closing while game clients are running: the first attempt is ALWAYS cancelled; the question is asked afterwards (not inside the
@@ -2769,6 +3491,15 @@ $form.Add_FormClosing({
             [void]$form.BeginInvoke([System.Windows.Forms.MethodInvoker]{ Confirm-Close })
         }
         return
+    }
+    if ($script:Active -ne $null -and $script:Active.Phase -eq 'hidden') {
+        # let the hidden-login thread finish cleanly (it kills Arc itself) instead of leaving it running after the window is gone
+        if ($script:HiddenState -ne $null) {
+            $script:HiddenState.Cancel = $true
+            for ($i = 0; $i -lt 100 -and -not $script:HiddenState.Done; $i++) { Start-Sleep -Milliseconds 100 }   # bounded wait (up to 10s)
+        }
+        Close-HiddenPopup
+        $script:Active = $null
     }
     Save-Accounts
     Save-Session

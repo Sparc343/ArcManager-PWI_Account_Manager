@@ -2,7 +2,7 @@
 
 A small, portable helper for people who play **Perfect World International** through the **Arc** launcher
 on several accounts. Keep your accounts in one window, press **SIGN IN**, and the manager starts Arc, types the
-login for you, lets the game launch, and closes Arc again so the next account can sign in.
+login for you, lets the game launch, and closes Arc again so the next account can sign in. It can even press Arc's **Play** and the patcher's **Start** for you, so one click on **SIGN IN** takes you all the way to the open game client.
 
 > **Unofficial.** This project is not made, endorsed or supported by Arc, Perfect World, Gameforge or any other
 > company. All names and trademarks belong to their owners. You use it at your own risk; please check the game's
@@ -22,17 +22,19 @@ Both run only one copy at a time (you cannot start the C++ and PowerShell versio
 ## Features
 
 - Any number of accounts, each with **username, password and a note** (for example the character name).
-- **One-click sign-in**: closes any old Arc, starts Arc, waits for its login window, types the username and password.
-- Closes Arc at the moment you choose (**when the launcher starts** or **when the game client starts**).
+- **One-click sign-in**: closes any old Arc, starts Arc, signs in, and takes you to the running game client. Two **Launcher Modes** (see *Launcher Modes and automation* below): **Hidden Arc Mode** (the default; Arc's window is kept off-screen) or **Show Arc Mode** (Arc's window is shown and the login is typed into it).
+- **Optional full automation** (Show Arc Mode): *Auto-click Play (arc)* and *Auto-click Start (launcher/patcher)* press those two buttons for you. Hidden Arc Mode always clicks both.
+- Closes Arc **the instant the launcher / patcher is detected** (no delay or choice settings any more), and force-closes the launcher / patcher itself the instant the game client starts.
+- Small always-on-top status pop-ups (**Obtaining ARC / PWI TOKEN Now** and **Starting Game**) so you always know the program is busy.
 - **CANCEL** (the SIGN IN button turns into CANCEL while working) closes Arc, the launcher and the patcher that this sign-in started.
 - **STOP** closes that account's game client.
 - Game client windows are **renamed to the note of their row**, so multiple clients are easy to tell apart.
 - **Remembers running game clients**: close and reopen the manager and it recognises the clients it started (by process id and start time).
 - **Private server mode**: a switch on the main window turns the manager into an account manager for private servers (no Arc), with its own account list. See *Private servers* below.
-- **Re-ordering accounts** with the up and down arrows at the left of every row.
+- **Re-ordering accounts** by dragging the grip (three lines) at the left of every row up or down as far as you like, or with **Alt+Up** / **Alt+Down**.
 - **Deleting accounts** with a minus button on every row: click (asks first), Shift+click (no question), or Control+click several rows and press Alt+D.
 - **Import / Export** of the accounts list as a text file.
-- A built-in **settings window** (gear icon) with *Basic*, *Advanced* and *Private Servers* pages, and a **log viewer** (paper icon) with *Copy log to clipboard*.
+- A built-in **settings window** (gear icon) with *Basic*, *Advanced* (sub-tabs *Shared Settings*, *Hidden Arc Mode* and *Show Arc Mode*) and *Private Servers* pages, and a **log viewer** (paper icon) with *Copy log to clipboard*.
 - Optional background picture (a nice default is built into both versions: into the .exe, and into the script as a text block at its end).
 - Closing the manager while game clients are running (in **either** list: Official or Private Servers) asks first.
 - Portable: no installer, nothing is written outside `%AppData%\ArcManager` (and the program's own folder if you choose).
@@ -44,8 +46,9 @@ Both run only one copy at a time (you cannot start the C++ and PowerShell versio
 ### C++ version
 1. Put `ArcManager.exe` anywhere (the desktop is fine - it does not leave files next to itself).
 2. Double-click it and accept the administrator prompt (see *Security and privacy* for why).
-3. Type a username, password and (optionally) a note in the first row. Use **+ Add account** for more rows.
-4. Press **SIGN IN**.
+3. **Important for Hidden Arc Mode:** make sure **Perfect World International is the first game in Arc's library list** (see *PWI must be the first game in Arc's library* below).
+4. Type a username, password and (optionally) a note in the first row. Use **+ Add account** for more rows.
+5. Press **SIGN IN**.
 
 ### PowerShell version
 1. Keep `ArcManager.ps1` and `StartArcManager.bat` together in one folder (the default background picture is built into the script).
@@ -62,8 +65,8 @@ The first time, the manager looks for `Arc.exe` by itself (a running Arc, the li
 | Control | What it does |
 |---|---|
 | **OFFICIAL Servers / PRIVATE Servers** switch | At the top of the window. OFFICIAL Servers = the game through Arc (the default). PRIVATE Servers = private servers, see below. Each mode has its own account list, and the window title shows the mode ("PWI Account Manager - Official Servers" / "- Private Servers"). The manager opens in the mode it was closed in. |
-| **Up / down arrows** (left and right of the minus button) | Move the account one place up or down; the whole row (texts, running game client, status) moves with it and the new order is saved right away. They are greyed out at the top or bottom of the list and while a sign-in is in progress. |
-| **Minus button** (middle of the three row buttons) | Deletes that account. It is grey and turns red when you point at it. **Click** = delete, after a confirmation that shows the username and note. **Shift+click** = delete without asking. **Control+click** = select the row (it turns red with a ring) so you can select several; then press **Alt+D** to delete them all (it asks once; **Esc** clears the selection). A counter next to the buttons shows how many rows are selected. A deleted account is gone from the list immediately and the list is saved right away (`accounts.txt.bak` keeps the version from before). The minus is greyed out for an account whose game client is running, and for all rows while a sign-in is in progress. There is always at least one row: deleting the last one just empties it. Rows left completely empty are also removed when you close the manager. |
+| **Drag handle** (three lines, far left of every row) | Press and hold the left mouse button on it and drag the row up or down: a blue line shows where the row will land, and the list scrolls by itself when you hold the mouse near its top or bottom edge. Let go to drop it (**Esc** while dragging cancels). The whole row (texts, running game client, status) moves with it and the new order is saved right away. **Keyboard:** press **Alt+Up** or **Alt+Down** while the cursor is in any box of a row to move that row one place. The handle is greyed out while a sign-in is in progress, and when there is only one row. |
+| **Minus button** (right of the drag handle) | Deletes that account. It is grey and turns red when you point at it. **Click** = delete, after a confirmation that shows the username and note. **Shift+click** = delete without asking. **Control+click** = select the row (it turns red with a ring) so you can select several; then press **Alt+D** to delete them all (it asks once; **Esc** clears the selection). A counter next to the buttons shows how many rows are selected. A deleted account is gone from the list immediately and the list is saved right away (`accounts.txt.bak` keeps the version from before). The minus is greyed out for an account whose game client is running, and for all rows while a sign-in is in progress. There is always at least one row: deleting the last one just empties it. Rows left completely empty are also removed when you close the manager. |
 | Username / Password / Notes | One account per row. The note is also used as the game window title. |
 | **SIGN IN** | Signs in that account. While it works the button reads **CANCEL**. |
 | **STOP** | Force-closes that account's game client (asks first if you enabled *Ask before stopping*). |
@@ -86,7 +89,7 @@ Open the **gear icon**. Changes take effect **immediately** after *SAVE CONFIGUR
 *LOAD DEFAULTS* only fills in the standard values; nothing is saved until you press Save.
 *OPEN SETTINGS FOLDER* opens the folder with all of the program's files.
 
-Settings that were dropped in a newer version (`PrivateStartDir`, `PrivateNoticeShown`) are removed from the file automatically. Everything is stored in a plain text file, `ArcManager.ini`, which you can also edit by hand (save it and restart the
+Settings that were dropped in a newer version (`PrivateStartDir`, `PrivateNoticeShown`, `LauncherGraceSeconds`, `GraceSeconds`, `CloseArcAt`) are removed from the file automatically. Everything is stored in a plain text file, `ArcManager.ini`, which you can also edit by hand (save it and restart the
 manager). Comments in the file are kept when the program saves.
 
 | Key | Default | Window label | Meaning |
@@ -94,13 +97,15 @@ manager). Comments in the file are kept when the program saves.
 | `ArcPath` | `C:\Program Files (x86)\Arc\Arc.exe` | Arc Location | Full path to Arc. The file **must be named `Arc.exe`**. |
 | `WindowWidth`, `WindowHeight` | `1280`, `720` | Main window | Size of the window's inside area in pixels (minimum 1040 x 420). |
 | `RememberWindowSize` | `1` | Remember the size when closing | Saves the size when you close the manager. |
-| `AutoFill` | `1` | Auto-fill username and password | Types the login for you. |
+| `UseHiddenLogin` | `1` | Launcher Mode | **Basic page.** `1` = **Hidden Arc Mode** (default), `0` = **Show Arc Mode**. See *Launcher Modes and automation*. |
+| `AutoFill` | `1` | Auto-fill username and password | **Show Arc Mode only** (Hidden Arc Mode always types the login itself). Types the login into Arc's visible window. |
+| `ClickArcPlay` | `1` | Auto-click Play (arc) | **Show Arc Mode only.** After auto-fill has typed the login and pressed Enter, also clicks Arc's **Play** button for you. Needs *Auto-fill* and *Press Enter after the password*. Hidden Arc Mode always clicks Play. |
+| `ClickPatcherStart` | `1` | Auto-click Start (launcher/patcher) | **Show Arc Mode only.** Once the launcher / patcher shows up, clicks its **Start** button (retrying until it succeeds) until the game client opens. **Hidden Arc Mode always clicks Start.** |
 | `PopupKey` | `enter` | Key for the pop-up | **Advanced page, "Login pop-up and typing".** The key (`enter` or `escape`) that clears any pop-ups before Arc's login page. |
 | `EntersBefore` | `0` | Enter/Escape presses for the pop-up | How many times that key is pressed before the username is typed (`0` = none). |
 | `PauseAfterPopupMs` | `1500` | Pause after the pop-up (ms) | Pause after those presses (only used when the count is above 0). |
 | `ClearBackspaces` | `0` | Backspaces to clear a box | Backspaces pressed before typing the username and the password, to remove old text (`0` = none). |
 | `EnterAfterPassword` | `1` | Press Enter after the password | Presses Enter after the password to log in. Turn it off if you want to press it yourself. |
-| `CloseArcAt` | `launcher` | Close Arc when | `launcher` = as soon as the launcher starts, `game` = when the game client starts. |
 | `ConfirmStop` | `0` | Ask before stopping a game client | Confirmation before STOP. |
 | `KillArcOnStart` | `1` | Close running Arc at start / sign-in | Closes a leftover Arc when the manager starts and before each sign-in. |
 | `RenameGameWindows` | `1` | Rename game windows to Notes | Sets each game window's title to its row's note. |
@@ -114,12 +119,17 @@ manager). Comments in the file are kept when the program saves.
 | `LoginDelayMs` | `3000` | Login delay (milliseconds) | Wait after Arc's login window appears, before typing. *(Advanced)* |
 | `MinWaitSeconds` | `6` | Minimum wait (seconds) | Never type sooner than this after starting Arc. *(Advanced)* |
 | `WindowTimeoutSeconds` | `40` | Login window timeout | Give up waiting for the login window. *(Advanced)* |
-| `LauncherGraceSeconds` | `2` | Delay after launcher | Wait before closing Arc (launcher mode). *(Advanced)* |
-| `GraceSeconds` | `6` | Delay after game | Wait before closing Arc (game mode). *(Advanced)* |
-| `TimeoutSeconds` | `300` | Give up after | Give up waiting for the game client. *(Advanced)* |
-| `PendingTimeoutSeconds` | `600` | Game wait after close | How long to keep watching for the client after Arc was closed early. *(Advanced)* |
-| `RenameDurationSeconds` | `180` | Rename duration | The game opens and closes windows while loading, so its windows are re-checked every second for this long after the client starts. Raise it on a slow computer. *(Advanced)* |
-| `StatusResetSeconds` | `90` | Reset status after | Seconds until *Stopped / Cancelled / Timed out* return to *Idle* (`0` = never). *(Advanced)* |
+| `TimeoutSeconds` | `300` | Give up after | Give up waiting for the game client. *(Advanced > Show Arc Mode)* |
+| `PendingTimeoutSeconds` | `600` | Game wait after close | How long to keep watching for the client after Arc was closed early. *(Advanced > Shared Settings)* |
+| `RenameDurationSeconds` | `180` | Rename duration | The game opens and closes windows while loading, so its windows are re-checked every second for this long after the client starts. Raise it on a slow computer. *(Advanced > Shared Settings)* |
+| `StatusResetSeconds` | `30` | Reset status after | Seconds until *Stopped / Cancelled / Timed out* return to *Idle* (`0` = never). *(Advanced > Shared Settings)* |
+| `PatcherStartPollIntervalMs` | `2000` | Click Start every (ms) | How often **Start** is clicked while waiting for the launcher / patcher to finish and launch the game. *(Advanced > Shared Settings)* |
+| `PatcherStartTimeoutSeconds` | `180` | Give up clicking after (sec) | Stop clicking **Start** after this long. *(Advanced > Shared Settings)* |
+| *(the labels in the PowerShell version are worded a little differently)* | | | Applies to the five `Hidden...` rows below. |
+| `HiddenKeyDelayMs`, `HiddenCharDelayMs`, `HiddenPostTabDelayMs`, `HiddenPostFieldDelayMs`, `HiddenHideSettleDelayMs` | `20` each | Key press delay, Typed character delay, Pause after Tab / a field / hiding Sign In (ms) | Tiny pauses used while the login is typed into the off-screen Arc. *(Advanced > Hidden Arc Mode)* |
+| `HiddenSignInTimeoutSeconds`, `HiddenSignInPollIntervalMs` | `300`, `500` | Sign In window timeout (sec), poll interval (ms) | How long to wait for Arc's Sign In window, and how often to check for it. *(Advanced > Hidden Arc Mode)* |
+| `HiddenMainWindowInitialDelayMs`, `HiddenMainWindowTimeoutSeconds`, `HiddenMainWindowPollIntervalMs` | `1600`, `60`, `500` | Initial delay before Play (ms), Main window timeout (sec), poll interval (ms) | After the login is submitted: how long to wait before looking for Arc's real main window (too soon can find an unfinished placeholder), how long to keep looking, and how often. *(Advanced > Hidden Arc Mode)* |
+| `HiddenPatcherWaitTimeoutSeconds`, `HiddenPatcherWaitPollIntervalMs` | `120`, `500` | Patcher wait timeout (sec), poll interval (ms) | After Play is clicked: how long to wait for the launcher / patcher to start, and how often to check. *(Advanced > Hidden Arc Mode)* |
 | `PrivateMode` | `0` | *(the switch on the main window)* | `1` = private server mode. |
 | `PrivateClientPath` | *(empty)* | Client or launcher location | **Private Servers page.** The program to start (the game client, or a launcher / patcher). |
 | `PrivateFlags` | `game:cpw nocheck startbypatcher console:1` | Command-line flags | Passed exactly as typed. The usual flags are filled in; change them for a server that needs different ones (copy the example above to get them back). |
@@ -150,6 +160,33 @@ Everything lives in `%AppData%\ArcManager` (type that into the Explorer address 
 
 **Portable mode:** if a file called `ArcManager.ini` sits next to the program, that copy is used instead.
 The program never creates it by itself.
+
+---
+
+## Launcher Modes and automation
+
+**Launcher Mode** (Basic page) decides how the manager gets through Arc's login. Either way Arc runs and signs in for real - the manager never bypasses Arc's own login.
+
+| Mode | What happens |
+|---|---|
+| **Hidden Arc Mode** (default) | Arc's window is hidden throughout the login process (it may flicker very briefly on your screen). The manager types the login, clicks **Play**, and closes Arc the instant the launcher / patcher is detected. **The game's launcher / patcher window is hidden too** (kept off-screen while **Start** is clicked for you, until the game client starts); there is no separate setting for this. A pop-up reading **Obtaining ARC / PWI TOKEN Now** is shown meanwhile, and disappears the moment the launcher / patcher is detected. |
+| **Show Arc Mode** | Arc's window is shown, and so is the launcher / patcher (it is never hidden in this mode). With *Auto-fill* on, the login is typed into it (the old pop-up method; its timing is on *Advanced > Show Arc Mode*). With *Auto-click Play (arc)* also on, **Play** is clicked for you too; otherwise you click it yourself. |
+
+**Starting the game.** In Hidden Arc Mode (always) or in Show Arc Mode with *Auto-click Start (launcher/patcher)* on, the manager keeps clicking **Start** on the launcher / patcher until it succeeds, then waits for the game client. A second pop-up, **Starting Game**, is shown meanwhile and closes the instant the game client (`elementclient.exe` or `elementclient_64.exe`) is detected (or on CANCEL / timeout). With the option off, press **Start** yourself; the manager still recognises the game client. The moment the game client starts, the launcher / patcher that sign-in started is **force-closed** (it can otherwise linger for a long time); this has no setting. It is skipped while another account is still signing in or waiting for its client, so that account's launcher is never closed by mistake.
+
+**Advanced page sub-tabs**
+
+- **Shared Settings** (opens first): settings used by both modes - *Game wait after close*, *Rename duration*, *Reset status after*, *Click Start every*, *Give up clicking after*.
+- **Hidden Arc Mode**: the timing of the hidden sign-in. Greyed out while Show Arc Mode is selected.
+- **Show Arc Mode**: the timing of the visible auto-fill method, and *Give up after*. Greyed out while Hidden Arc Mode is selected.
+
+### PWI must be the first game in Arc's library
+
+The automatic **Play** click (always in Hidden Arc Mode, and in Show Arc Mode when *Auto-click Play (arc)* is on) is sent to a fixed spot on Arc's main window: the **first game in Arc's library list**. If **Perfect World International is not the first game there, a different Arc game may be started instead.** This matters if you also play other games through Arc.
+
+Recommended: in Arc's library, **sort by "last played"** (if your version of Arc offers it) and make sure **PWI was the last game you played before using the manager**. After that the manager keeps it that way by itself, because every game it starts is PWI - until you start another game from Arc, which moves that game to the top. If in doubt, open Arc, check that PWI is first, and close it again. Show Arc Mode without *Auto-click Play (arc)* does not have this limit, since you click Play yourself.
+
+Clicks are sent to the windows as messages, so they work even when a window is hidden or in the background. They use fixed positions measured on Arc's main window and on the game patcher (`984 x 744`); if a future Arc or patcher update moves its buttons, the automatic clicks may miss and you can simply click the button yourself (turn the matching *Auto-click* option off if it gets in the way).
 
 ---
 
@@ -211,11 +248,13 @@ settings. It contains **no paths, usernames or passwords**, so it is safe to pas
 
 1. Click the **paper icon**, then **COPY LOG TO CLIPBOARD**, and look at (or share) the text.
 2. *Arc not found*: set **Arc Location** with the gear icon (Browse...).
-3. *Typing goes to the wrong box or too early*: **Advanced** page - raise **Login delay**, or change the **Tabs** values. If Arc shows a message before its login page, use *Login pop-up and typing* on the same page.
+3. *Typing goes to the wrong box or too early* (Show Arc Mode): **Advanced > Show Arc Mode** - raise **Login delay**, or change the **Tabs** values. If Arc shows a message before its login page, use *Login pop-up and typing* on the same page.
 4. *Game windows are not renamed*: check *Rename game windows to Notes*, that the row has a note, and raise
    **Rename duration** on a slow computer.
-5. *Accounts file damaged*: the previous version is `accounts.txt.bak` in the same folder.
-6. *Start over*: close the manager and delete `ArcManager.ini` (settings) - it is recreated with the defaults.
+5. *A different Arc game starts*: PWI is not the first game in Arc's library list - see *PWI must be the first game in Arc's library*.
+6. *Hidden Arc Mode does not get past a step* (or a pop-up stays): see the log; raise the matching timeout on **Advanced > Hidden Arc Mode**, or switch to **Show Arc Mode** on the Basic page. *A launcher / patcher is invisible and seems stuck* (Hidden Arc Mode hides it): press **CANCEL** on the row (that closes it), or switch to **Show Arc Mode** to see what it is asking. *Start is not clicked*: check *Auto-click Start*, and raise **Give up clicking after** on **Advanced > Shared Settings**.
+7. *Accounts file damaged*: the previous version is `accounts.txt.bak` in the same folder.
+8. *Start over*: close the manager and delete `ArcManager.ini` (settings) - it is recreated with the defaults.
 
 ---
 
