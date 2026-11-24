@@ -12,7 +12,7 @@
 # Change them with the gear button in the program. To edit the file by hand, save it and restart the program.
 # A copy of ArcManager.ini placed next to this script is used instead of that one (portable mode).
 # Program version, shown in the log and in the settings window. >>> Change it here when you release a new version. <<<
-$AppVersion = 'v6.NOV.2026'
+$AppVersion = 'v23.NOV.2026'
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ScriptPath = $MyInvocation.MyCommand.Path
 $ConfigDir = Join-Path $env:APPDATA 'ArcManager'
@@ -492,6 +492,11 @@ $DefaultIniText = @'
 [Settings]
 ; Full path to Arc.exe (the file must be named Arc.exe)
 ArcPath=C:\Program Files (x86)\Arc\Arc.exe
+; Full path to the game's launcher / patcher. The Update Client button at the top of the main window opens it so you can update the
+; game client. Updates are NEVER detected automatically - you have to keep the client up to date yourself.
+PatcherPath=C:\Program Files (x86)\PWI_en\patcher\patcher.exe
+; command-line flags for that patcher (it needs arc:1 to start Arc; change it if that ever changes)
+PatcherFlags=arc:1
 ; Window size. The window can also be resized by hand; RememberWindowSize=1 saves the size when you close the program.
 WindowWidth=1280
 WindowHeight=720
@@ -536,6 +541,10 @@ PrivateMode=0
 ; the program to start (the game client or a launcher; it starts in its own folder) and its command-line flags
 PrivateClientPath=
 PrivateFlags=game:cpw nocheck startbypatcher console:1
+; the private server's launcher / patcher (opened by the Update Client button while PRIVATE is selected)
+PrivatePatcherPath=
+; command-line flags for the private server's patcher
+PrivatePatcherFlags=
 ; show a warning every time you switch to Private Servers: 1 = yes, 0 = no
 PrivateShowWarning=1
 ; process name(s) of the real game client, separated by commas
@@ -564,12 +573,12 @@ HiddenPostTabDelayMs=20
 HiddenPostFieldDelayMs=20
 HiddenHideSettleDelayMs=20
 HiddenSignInTimeoutSeconds=300
-HiddenSignInPollIntervalMs=500
+HiddenSignInPollIntervalMs=1000
 HiddenMainWindowInitialDelayMs=1600
 HiddenMainWindowTimeoutSeconds=60
-HiddenMainWindowPollIntervalMs=500
+HiddenMainWindowPollIntervalMs=1000
 HiddenPatcherWaitTimeoutSeconds=120
-HiddenPatcherWaitPollIntervalMs=500
+HiddenPatcherWaitPollIntervalMs=1000
 ; automatically click Start on the launcher/patcher once it appears, so sign-in truly finishes the job.
 ; applies to both Launcher Modes (Hidden Arc Mode and Show Arc Mode)
 ClickPatcherStart=1
@@ -603,6 +612,7 @@ function Ensure-UnicodeIni([string]$path) {
 function Get-DefaultValues {
     return @{
         ArcPath = 'C:\Program Files (x86)\Arc\Arc.exe'
+        PatcherPath = 'C:\Program Files (x86)\PWI_en\patcher\patcher.exe'; PrivatePatcherPath = ''; PatcherFlags = 'arc:1'; PrivatePatcherFlags = ''
         WindowWidth = 1280; WindowHeight = 720; RememberWindowSize = $true
         AutoFill = $true; UsernameFocusTabs = 1; FieldSeparatorTabs = 1
         LoginDelayMs = 3000; MinWaitSeconds = 6; WindowTimeoutSeconds = 40
@@ -619,9 +629,9 @@ function Get-DefaultValues {
         PrivateFlags = 'game:cpw nocheck startbypatcher console:1'
         UseHiddenLogin = $true
         HiddenKeyDelayMs = 20; HiddenCharDelayMs = 20; HiddenPostTabDelayMs = 20; HiddenPostFieldDelayMs = 20; HiddenHideSettleDelayMs = 20
-        HiddenSignInTimeoutSeconds = 300; HiddenSignInPollIntervalMs = 500
-        HiddenMainWindowInitialDelayMs = 1600; HiddenMainWindowTimeoutSeconds = 60; HiddenMainWindowPollIntervalMs = 500
-        HiddenPatcherWaitTimeoutSeconds = 120; HiddenPatcherWaitPollIntervalMs = 500
+        HiddenSignInTimeoutSeconds = 300; HiddenSignInPollIntervalMs = 1000
+        HiddenMainWindowInitialDelayMs = 1600; HiddenMainWindowTimeoutSeconds = 60; HiddenMainWindowPollIntervalMs = 1000
+        HiddenPatcherWaitTimeoutSeconds = 120; HiddenPatcherWaitPollIntervalMs = 1000
         ClickPatcherStart = $true; PatcherStartPollIntervalMs = 2000; PatcherStartTimeoutSeconds = 180
         ClickArcPlay = $true
     }
@@ -641,6 +651,10 @@ function Get-IniBool([string]$key, [bool]$def) {
 function Load-Settings {
     $d = Get-DefaultValues
     $script:ArcPath = (Get-IniText 'ArcPath' $d.ArcPath).Trim()
+    $script:PatcherPath = (Get-IniText 'PatcherPath' $d.PatcherPath).Trim()
+    $script:PrivatePatcherPath = (Get-IniText 'PrivatePatcherPath' '').Trim()
+    $script:PatcherFlags = (Get-IniText 'PatcherFlags' $d.PatcherFlags).Trim()
+    $script:PrivatePatcherFlags = (Get-IniText 'PrivatePatcherFlags' $d.PrivatePatcherFlags).Trim()
     $script:WindowWidth = [math]::Max(1040, (Get-IniInt 'WindowWidth' $d.WindowWidth))
     $script:WindowHeight = [math]::Max(420, (Get-IniInt 'WindowHeight' $d.WindowHeight))
     $script:RememberWindowSize = Get-IniBool 'RememberWindowSize' $d.RememberWindowSize
@@ -911,7 +925,7 @@ function Finish-Active([string]$text, $color, [bool]$transient = $false) {
 }
 # small always-on-top notice shown during a long async wait so the user doesn't think the program froze.
 # Shared by both status popups ("Obtaining ARC / PWI TOKEN Now" and "Starting Game") - same size and font either way.
-function New-StatusPopup([string]$text) {
+function New-StatusPopup([string]$text, [string]$sub = '') {
     $p = New-Object System.Windows.Forms.Form
     $p.Text = 'ArcManager'
     $p.FormBorderStyle = 'FixedDialog'
@@ -922,6 +936,16 @@ function New-StatusPopup([string]$text) {
     $p.StartPosition = 'CenterScreen'
     $p.TopMost = $true
     $p.ClientSize = New-Object System.Drawing.Size(500, 300)
+    if ($sub -ne '') {   # a small line at the very bottom, centered (smaller than the main text, but easy to read); added first so it stays in front
+        $sl = New-Object System.Windows.Forms.Label
+        $sl.Text = $sub
+        $sl.AutoSize = $false
+        $sl.TextAlign = 'BottomCenter'
+        $sl.Font = New-Object System.Drawing.Font('Segoe UI', 10.5)
+        $sl.ForeColor = [System.Drawing.SystemColors]::GrayText
+        $sl.SetBounds(0, 262, 500, 24)
+        $p.Controls.Add($sl)
+    }
     $lbl = New-Object System.Windows.Forms.Label
     $lbl.Text = $text
     $lbl.TextAlign = 'MiddleCenter'
@@ -949,7 +973,7 @@ function Close-HiddenPopup {
 # instant the real game client (elementclient.exe / elementclient_64.exe) is detected.
 function Show-StartingPopup {
     if ($script:StartingPopup -ne $null) { return }
-    $script:StartingPopup = New-StatusPopup 'Starting Game'
+    $script:StartingPopup = New-StatusPopup 'Starting Game' '(Check for updates [manually] if this fails)'
 }
 function Close-StartingPopup {
     Close-StatusPopup ([ref]$script:StartingPopup)
@@ -1757,42 +1781,42 @@ if ($KillArcOnStart -and -not $PrivateMode) {   # (private server mode never tou
 # ---------- settings window (gear button) ----------
 # whole-number settings (text boxes); the variable of the same name holds the value
 $script:NumFields = @(
-    @{ Key = 'WindowWidth';           Label = 'Window width';                   Min = 1040; Max = 7680 },
-    @{ Key = 'WindowHeight';          Label = 'Window height';                  Min = 420; Max = 4320 },
-    @{ Key = 'UsernameFocusTabs';     Label = 'Tabs before username box';       Min = 0;   Max = 20 },
-    @{ Key = 'FieldSeparatorTabs';    Label = 'Tabs between the two boxes';     Min = 0;   Max = 20 },
-    @{ Key = 'LoginDelayMs';          Label = 'Login delay (milliseconds)';     Min = 0;   Max = 60000 },
-    @{ Key = 'MinWaitSeconds';        Label = 'Minimum wait (seconds)';         Min = 0;   Max = 600 },
-    @{ Key = 'WindowTimeoutSeconds';  Label = 'Login window timeout (seconds)'; Min = 1;   Max = 600 },
-    @{ Key = 'TimeoutSeconds';        Label = 'Give up after (seconds)';        Min = 10;  Max = 86400 },
-    @{ Key = 'PendingTimeoutSeconds'; Label = 'Game wait after close (seconds)'; Min = 10; Max = 86400 },
-    @{ Key = 'RenameDurationSeconds'; Label = 'Rename duration (seconds)';      Min = 10;  Max = 3600 },
-    @{ Key = 'StatusResetSeconds';    Label = 'Reset status after (seconds)'; Min = 0; Max = 86400 },
-    @{ Key = 'PrivateWindowWaitSeconds';    Label = 'Wait for the game window (sec)';  Min = 1; Max = 3600 },
-    @{ Key = 'PrivateFirstKeyDelaySeconds'; Label = 'Wait before the first key (sec)'; Min = 0; Max = 600 },
-    @{ Key = 'PrivateEntersBefore';         Label = 'Enter/Escape presses for the pop-up';    Min = 0; Max = 10 },
-    @{ Key = 'PrivatePauseAfterPopupMs';    Label = 'Pause after the pop-up (ms)';     Min = 0; Max = 60000 },
-    @{ Key = 'PrivatePauseStepMs';          Label = 'Pause between steps (ms)';        Min = 0; Max = 60000 },
-    @{ Key = 'PrivateTabs';                 Label = 'Tabs between the two boxes';      Min = 0; Max = 10 },
-    @{ Key = 'PrivateClearBackspaces';      Label = 'Backspaces to clear a box';       Min = 0; Max = 60 },
-    @{ Key = 'EntersBefore';                Label = 'Enter/Escape presses for the pop-up'; Min = 0; Max = 10 },
-    @{ Key = 'PauseAfterPopupMs';           Label = 'Pause after the pop-up (ms)';     Min = 0; Max = 60000 },
-    @{ Key = 'ClearBackspaces';             Label = 'Backspaces to clear a box';       Min = 0; Max = 60 },
-    @{ Key = 'HiddenKeyDelayMs';            Label = 'Key press hold (ms)';             Min = 0; Max = 5000 },
-    @{ Key = 'HiddenCharDelayMs';           Label = 'Delay between characters (ms)';   Min = 0; Max = 5000 },
-    @{ Key = 'HiddenPostTabDelayMs';        Label = 'Pause after Tab (ms)';            Min = 0; Max = 5000 },
-    @{ Key = 'HiddenPostFieldDelayMs';      Label = 'Pause after each box (ms)';       Min = 0; Max = 5000 },
-    @{ Key = 'HiddenHideSettleDelayMs';     Label = 'Pause after hiding (ms)';         Min = 0; Max = 5000 },
-    @{ Key = 'HiddenSignInTimeoutSeconds';  Label = 'Give up finding Sign In (sec)';   Min = 1; Max = 3600 },
-    @{ Key = 'HiddenSignInPollIntervalMs';  Label = 'Check for Sign In every (ms)';    Min = 100; Max = 10000 },
-    @{ Key = 'HiddenMainWindowInitialDelayMs'; Label = 'Wait before looking for Play (ms)'; Min = 0; Max = 20000 },
-    @{ Key = 'HiddenMainWindowTimeoutSeconds'; Label = 'Give up finding Play (sec)';   Min = 1; Max = 3600 },
-    @{ Key = 'HiddenMainWindowPollIntervalMs'; Label = 'Check for Play every (ms)';    Min = 100; Max = 10000 },
-    @{ Key = 'HiddenPatcherWaitTimeoutSeconds'; Label = 'Watch for the launcher (sec)'; Min = 0; Max = 3600 },
-    @{ Key = 'HiddenPatcherWaitPollIntervalMs'; Label = 'Check for the launcher every (ms)'; Min = 100; Max = 10000 },
+    @{ Key = 'WindowWidth';           Label = 'Window Width';                   Min = 1040; Max = 7680 },
+    @{ Key = 'WindowHeight';          Label = 'Window Height';                  Min = 420; Max = 4320 },
+    @{ Key = 'UsernameFocusTabs';     Label = 'Tabs Before Username Box';       Min = 0;   Max = 20 },
+    @{ Key = 'FieldSeparatorTabs';    Label = 'Tabs Between the Two Boxes';     Min = 0;   Max = 20 },
+    @{ Key = 'LoginDelayMs';          Label = 'Login Delay (milliseconds)';     Min = 0;   Max = 60000 },
+    @{ Key = 'MinWaitSeconds';        Label = 'Minimum Wait (seconds)';         Min = 0;   Max = 600 },
+    @{ Key = 'WindowTimeoutSeconds';  Label = 'Login Window Timeout (seconds)'; Min = 1;   Max = 600 },
+    @{ Key = 'TimeoutSeconds';        Label = 'Give Up After (seconds)';        Min = 10;  Max = 86400 },
+    @{ Key = 'PendingTimeoutSeconds'; Label = 'Game Wait After Close (seconds)'; Min = 10; Max = 86400 },
+    @{ Key = 'RenameDurationSeconds'; Label = 'Rename Duration (seconds)';      Min = 10;  Max = 3600 },
+    @{ Key = 'StatusResetSeconds';    Label = 'Reset Status After (seconds)'; Min = 0; Max = 86400 },
+    @{ Key = 'PrivateWindowWaitSeconds';    Label = 'Wait for the Game Window (sec)';  Min = 1; Max = 3600 },
+    @{ Key = 'PrivateFirstKeyDelaySeconds'; Label = 'Wait Before the First Key (sec)'; Min = 0; Max = 600 },
+    @{ Key = 'PrivateEntersBefore';         Label = 'Enter/Escape Presses for the Pop-Up';    Min = 0; Max = 10 },
+    @{ Key = 'PrivatePauseAfterPopupMs';    Label = 'Pause After the Pop-Up (ms)';     Min = 0; Max = 60000 },
+    @{ Key = 'PrivatePauseStepMs';          Label = 'Pause Between Steps (ms)';        Min = 0; Max = 60000 },
+    @{ Key = 'PrivateTabs';                 Label = 'Tabs Between the Two Boxes';      Min = 0; Max = 10 },
+    @{ Key = 'PrivateClearBackspaces';      Label = 'Backspaces to Clear a Box';       Min = 0; Max = 60 },
+    @{ Key = 'EntersBefore';                Label = 'Enter/Escape Presses for the Pop-Up'; Min = 0; Max = 10 },
+    @{ Key = 'PauseAfterPopupMs';           Label = 'Pause After the Pop-Up (ms)';     Min = 0; Max = 60000 },
+    @{ Key = 'ClearBackspaces';             Label = 'Backspaces to Clear a Box';       Min = 0; Max = 60 },
+    @{ Key = 'HiddenKeyDelayMs';            Label = 'Key Press Hold (ms)';             Min = 0; Max = 5000 },
+    @{ Key = 'HiddenCharDelayMs';           Label = 'Delay Between Characters (ms)';   Min = 0; Max = 5000 },
+    @{ Key = 'HiddenPostTabDelayMs';        Label = 'Pause After Tab (ms)';            Min = 0; Max = 5000 },
+    @{ Key = 'HiddenPostFieldDelayMs';      Label = 'Pause After Each Box (ms)';       Min = 0; Max = 5000 },
+    @{ Key = 'HiddenHideSettleDelayMs';     Label = 'Pause After Hiding (ms)';         Min = 0; Max = 5000 },
+    @{ Key = 'HiddenSignInTimeoutSeconds';  Label = 'Give Up Finding Sign In (sec)';   Min = 1; Max = 3600 },
+    @{ Key = 'HiddenSignInPollIntervalMs';  Label = 'Check for Sign In Every (ms)';    Min = 100; Max = 10000 },
+    @{ Key = 'HiddenMainWindowInitialDelayMs'; Label = 'Wait Before Looking for Play (ms)'; Min = 0; Max = 20000 },
+    @{ Key = 'HiddenMainWindowTimeoutSeconds'; Label = 'Give Up Finding Play (sec)';   Min = 1; Max = 3600 },
+    @{ Key = 'HiddenMainWindowPollIntervalMs'; Label = 'Check for Play Every (ms)';    Min = 100; Max = 10000 },
+    @{ Key = 'HiddenPatcherWaitTimeoutSeconds'; Label = 'Watch for the Launcher (sec)'; Min = 0; Max = 3600 },
+    @{ Key = 'HiddenPatcherWaitPollIntervalMs'; Label = 'Check for the Launcher Every (ms)'; Min = 100; Max = 10000 },
     # clicking Start on the launcher/patcher (applies to both Launcher Modes)
-    @{ Key = 'PatcherStartPollIntervalMs';   Label = 'Click Start every (ms)';       Min = 200; Max = 60000 },
-    @{ Key = 'PatcherStartTimeoutSeconds';   Label = 'Give up clicking after (sec)'; Min = 1;   Max = 3600 }
+    @{ Key = 'PatcherStartPollIntervalMs';   Label = 'Click Start Every (ms)';       Min = 200; Max = 60000 },
+    @{ Key = 'PatcherStartTimeoutSeconds';   Label = 'Give Up Clicking After (sec)'; Min = 1;   Max = 3600 }
 )
 # on/off settings (tick boxes)
 $script:BoolFields = @('RememberWindowSize', 'AutoFill', 'ConfirmStop', 'KillArcOnStart', 'DebugLog', 'RenameGameWindows', 'ShowStorageHint', 'PrivateEnterAfterPassword', 'PrivateShowWarning', 'EnterAfterPassword', 'ClickPatcherStart', 'ClickArcPlay')
@@ -1814,7 +1838,7 @@ $script:SetLoading = $false
 $script:SetBuilt = $false
 
 function Get-CurrentValues {
-    $v = @{ PopupKey = $PopupKey; PrivatePopupKey = $PrivatePopupKey; PrivateClientPath = $PrivateClientPath; PrivateFlags = $PrivateFlags; PrivateProcessNames = $PrivateProcessNames; ArcPath = $ArcPath; BackgroundImage = $BackgroundImage; BackgroundMode = $BackgroundMode; BackgroundDim = $BackgroundDim; UseHiddenLogin = [bool]$UseHiddenLogin }
+    $v = @{ PopupKey = $PopupKey; PrivatePopupKey = $PrivatePopupKey; PrivateClientPath = $PrivateClientPath; PrivateFlags = $PrivateFlags; PrivateProcessNames = $PrivateProcessNames; ArcPath = $ArcPath; PatcherPath = $PatcherPath; PrivatePatcherPath = $PrivatePatcherPath; PatcherFlags = $PatcherFlags; PrivatePatcherFlags = $PrivatePatcherFlags; BackgroundImage = $BackgroundImage; BackgroundMode = $BackgroundMode; BackgroundDim = $BackgroundDim; UseHiddenLogin = [bool]$UseHiddenLogin }
     foreach ($f in $script:NumFields) { $v[$f.Key] = [int](Get-Variable -Name $f.Key -Scope Script -ValueOnly) }
     foreach ($k in $script:BoolFields) { $v[$k] = [bool](Get-Variable -Name $k -Scope Script -ValueOnly) }
     return $v
@@ -1830,7 +1854,7 @@ function Update-SEnabled {
     $u['PendingTimeoutSeconds'].Enabled = (-not $priv)
     $u['TimeoutSeconds'].Enabled = (-not $priv)
     $u['RenameDurationSeconds'].Enabled = $u['RenameGameWindows'].Checked
-    foreach ($k in @('ArcPath', 'BrowseArc', 'ModeHidden', 'ModeShow', 'KillArcOnStart')) { $u[$k].Enabled = (-not $priv) }
+    foreach ($k in @('ArcPath', 'BrowseArc', 'PatcherPath', 'PatcherFlags', 'BrowsePatcher', 'ModeHidden', 'ModeShow', 'KillArcOnStart')) { $u[$k].Enabled = (-not $priv) }
     $hl = $u['ModeHidden'].Checked
     $u['ClickPatcherStart'].Enabled = (-not $priv -and -not $hl)   # Show Arc Mode only - Hidden Arc Mode always clicks Start
     $u['PatcherStartPollIntervalMs'].Enabled = (-not $priv -and ($u['ClickPatcherStart'].Checked -or $hl))
@@ -1854,6 +1878,10 @@ function Set-UiFromValues($v) {
     $script:SetLoading = $true
     $u = $script:Ui
     $u['ArcPath'].Text = [string]$v['ArcPath']
+    $u['PatcherPath'].Text = [string]$v['PatcherPath']
+    $u['PrivatePatcherPath'].Text = [string]$v['PrivatePatcherPath']
+    $u['PatcherFlags'].Text = [string]$v['PatcherFlags']
+    $u['PrivatePatcherFlags'].Text = [string]$v['PrivatePatcherFlags']
     $u['PrivateClientPath'].Text = [string]$v['PrivateClientPath']
     $u['PrivateFlags'].Text = [string]$v['PrivateFlags']
     $u['PrivateProcessNames'].Text = [string]$v['PrivateProcessNames']
@@ -1891,6 +1919,10 @@ function Read-UiValues {
         return $null
     }
     $v['ArcPath'] = $arc
+    $v['PatcherPath'] = $u['PatcherPath'].Text.Trim()
+    $v['PrivatePatcherPath'] = $u['PrivatePatcherPath'].Text.Trim()
+    $v['PatcherFlags'] = $u['PatcherFlags'].Text.Trim()
+    $v['PrivatePatcherFlags'] = $u['PrivatePatcherFlags'].Text.Trim()
     $v['PrivateClientPath'] = $u['PrivateClientPath'].Text.Trim()
     $v['PrivateFlags'] = $u['PrivateFlags'].Text.Trim()
     $v['PrivateProcessNames'] = $u['PrivateProcessNames'].Text.Trim()
@@ -1932,6 +1964,10 @@ function Read-UiValues {
 # makes the values the active settings
 function Apply-Values($v) {
     $script:ArcPath = $v['ArcPath']
+    $script:PatcherPath = $v['PatcherPath']
+    $script:PrivatePatcherPath = $v['PrivatePatcherPath']
+    $script:PatcherFlags = $v['PatcherFlags']
+    $script:PrivatePatcherFlags = $v['PrivatePatcherFlags']
     $script:PrivateClientPath = $v['PrivateClientPath']
     $script:PrivateFlags = $v['PrivateFlags']
     $script:PrivateProcessNames = $v['PrivateProcessNames']
@@ -1950,7 +1986,7 @@ function Apply-Values($v) {
 function Write-SettingsToIni($v) {
     $ok = $true
     if (-not [IniFile]::Put($IniFile, 'ArcPath', [string]$v['ArcPath'])) { $ok = $false }
-    foreach ($k in @('PrivateClientPath', 'PrivateFlags', 'PrivateProcessNames')) { if (-not [IniFile]::Put($IniFile, $k, [string]$v[$k])) { $ok = $false } }
+    foreach ($k in @('PatcherPath', 'PrivatePatcherPath', 'PatcherFlags', 'PrivatePatcherFlags', 'PrivateClientPath', 'PrivateFlags', 'PrivateProcessNames')) { if (-not [IniFile]::Put($IniFile, $k, [string]$v[$k])) { $ok = $false } }
     foreach ($f in $script:NumFields) { if (-not [IniFile]::Put($IniFile, $f.Key, [string]$v[$f.Key])) { $ok = $false } }
     foreach ($k in $script:BoolFields) {
         $t = '0'
@@ -2020,11 +2056,12 @@ function Save-Settings {
 }
 
 # ---- small builders (x / y are positions inside the settings window, even for controls inside a group box)
+$script:SYShift = 0   # added to every y while the settings window is built (a page that got an extra row pushes the rest down)
 function Add-SCtl($parent, $ctl, [int]$x, [int]$y, [int]$w, [int]$h) {
     $ox = 0
     $oy = 0
     if ($parent -is [System.Windows.Forms.GroupBox]) { $ox = $parent.Left; $oy = $parent.Top }
-    $ctl.SetBounds(($x - $ox), ($y - $oy), $w, $h)
+    $ctl.SetBounds(($x - $ox), (($y + $script:SYShift) - $oy), $w, $h)
     $parent.Controls.Add($ctl)
     if ($null -ne $script:PageList) { [void]$script:PageList.Add($ctl) }   # (null on the LEFT: an empty list on the left would count as false)
 }
@@ -2136,9 +2173,11 @@ function Show-Settings {
     $dlg.StartPosition = 'CenterParent'
     $dlg.AutoScaleMode = 'None'
     $dlg.Font = New-Object System.Drawing.Font('Segoe UI', 9.5)
-    $dlg.ClientSize = New-Object System.Drawing.Size(640, 558)
+    $dlg.ClientSize = New-Object System.Drawing.Size(640, 602)
     $dlg.BackColor = [System.Drawing.SystemColors]::Control
     $dlg.ForeColor = [System.Drawing.SystemColors]::ControlText
+    $dlg.KeyPreview = $true
+    $dlg.Add_KeyDown({ param($s, $e) if ($e.KeyCode -eq [System.Windows.Forms.Keys]::F1) { Show-Help; $e.Handled = $true; $e.SuppressKeyPress = $true } })   # F1: the built-in help
     $tt = New-Object System.Windows.Forms.ToolTip
     $tt.AutoPopDelay = 20000
     $script:SetTip = $tt
@@ -2151,6 +2190,7 @@ function Show-Settings {
     $script:PageAdvShow.Clear()
     $script:AdvSub = 0
     $script:PageList = $null
+    $script:SYShift = 0
     $title = New-SLabel $dlg 'CONFIGURATION' 16 8 250 36
     $title.Font = New-Object System.Drawing.Font('Segoe UI', 18, [System.Drawing.FontStyle]::Bold)
     # two push-like radio buttons switch between the pages
@@ -2181,16 +2221,23 @@ function Show-Settings {
     [void](New-SEdit $dlg 'ArcPath' 16 72 520 $false)
     $b1 = New-SButton 'BrowseArc' 'Browse...' 544 71 80 25
     $b1.Add_Click({ Browse-Into 'ArcPath' 'Arc.exe|Arc.exe|All files|*.*' 'Locate Arc.exe' })
+    [void](New-SLabel $dlg 'Patcher Location' 16 98 300 20)   # opened by the Update Client button at the top of the main window
+    [void](New-SEdit $dlg 'PatcherPath' 16 120 386 $false)
+    [void](New-SLabel $dlg 'Command-Line Flags' 410 98 126 20)   # same line as the location
+    [void](New-SEdit $dlg 'PatcherFlags' 410 120 126 $false)
+    $b1p = New-SButton 'BrowsePatcher' 'Browse...' 544 119 80 25
+    $b1p.Add_Click({ Browse-Into 'PatcherPath' 'Programs (*.exe)|*.exe|All files|*.*' "Locate the game's launcher / patcher" })
+    $script:SYShift = 44   # the rest of the Basic page moves down to make room for the row above
 
     # ======== page 1: Basic
     $script:PageList = $script:PageBasic
-    $g = New-SGroup 'Main window' 16 106 300 84
+    $g = New-SGroup 'Main Window' 16 106 300 84
     [void](New-SLabel $g 'Width' 28 128 42 23)
     [void](New-SEdit $g 'WindowWidth' 72 128 58 $true)
     [void](New-SLabel $g 'Height' 144 128 44 23)
     [void](New-SEdit $g 'WindowHeight' 190 128 58 $true)
-    [void](New-SLabel $g 'pixels' 256 128 44 23)
-    [void](New-SCheck $g 'RememberWindowSize' 'Remember the size when closing' 28 158 266)
+    [void](New-SLabel $g 'Pixels' 256 128 44 23)
+    [void](New-SCheck $g 'RememberWindowSize' 'Remember the Size When Closing' 28 158 266)
 
     $g = New-SGroup 'Launcher Mode' 16 198 300 82
     [void](New-SRadio $g 'ModeHidden' 'Hidden Arc Mode' 28 220 266)
@@ -2198,20 +2245,20 @@ function Show-Settings {
 
     $g = New-SGroup 'Options' 332 106 292 222
     [void](New-SCheck $g 'DebugLog' 'Debug / Logs' 344 130 270)
-    [void](New-SCheck $g 'KillArcOnStart' 'Close running Arc at start / sign-in' 344 154 270)
-    [void](New-SCheck $g 'AutoFill' 'Auto-fill username and password' 344 178 270)
-    [void](New-SCheck $g 'ClickArcPlay' 'Auto-click Play (arc)' 344 202 270)
-    [void](New-SCheck $g 'ClickPatcherStart' 'Auto-click Start (launcher/patcher)' 344 226 270)
-    [void](New-SCheck $g 'RenameGameWindows' 'Rename game windows to Notes' 344 250 270)
-    [void](New-SCheck $g 'ConfirmStop' 'Ask before stopping a game client' 344 274 270)
-    [void](New-SCheck $g 'ShowStorageHint' 'Show plain-text storage notice' 344 298 270)
+    [void](New-SCheck $g 'KillArcOnStart' 'Close Running Arc at Start / Sign-In' 344 154 270)
+    [void](New-SCheck $g 'AutoFill' 'Auto-Fill Username and Password' 344 178 270)
+    [void](New-SCheck $g 'ClickArcPlay' 'Auto-Click Play (Arc)' 344 202 270)
+    [void](New-SCheck $g 'ClickPatcherStart' 'Auto-Click Start (Launcher/Patcher)' 344 226 270)
+    [void](New-SCheck $g 'RenameGameWindows' 'Rename Game Windows to Notes' 344 250 270)
+    [void](New-SCheck $g 'ConfirmStop' 'Ask Before Stopping a Game Client' 344 274 270)
+    [void](New-SCheck $g 'ShowStorageHint' 'Show Plain-Text Storage Notice' 344 298 270)
 
     $g = New-SGroup 'Background' 16 336 608 146
     [void](New-SLabel $g 'Background Image Location' 28 332 300 20)
     [void](New-SEdit $g 'BackgroundImage' 28 354 496 $false)
     $b2 = New-SButton 'BrowseBg' 'Browse...' 532 353 80 25
     $g.Controls.Add($b2)
-    $b2.SetBounds((532 - $g.Left), (353 - $g.Top), 80, 25)
+    $b2.SetBounds((532 - $g.Left), ((353 + $script:SYShift) - $g.Top), 80, 25)
     $b2.Add_Click({ Browse-Into 'BackgroundImage' 'Pictures|*.png;*.jpg;*.jpeg;*.bmp;*.gif|All files|*.*' 'Choose a background image' })
     [void](New-SLabel $g 'Mode' 28 390 44 20)
     for ($i = 0; $i -lt 5; $i++) { [void](New-SRadio $g ('Mode' + $i) $script:ModeLabels[$i] (74 + $i * 96) 390 92) }
@@ -2229,6 +2276,7 @@ function Show-Settings {
     $script:Ui['DimLbl'] = $dl
 
     # ======== page 2: Advanced - one shared description, then three sub-tabs: Shared Settings (default), Hidden Arc Mode and Show Arc Mode
+    $script:SYShift = 0
     $script:PageList = $script:PageAdv
     [void](New-SLabel $dlg 'Timing and fine-tuning. The defaults suit most computers.' 16 108 608 20)
     $sa = New-Object System.Windows.Forms.RadioButton
@@ -2255,13 +2303,13 @@ function Show-Settings {
 
     # ---- Advanced / Shared Settings sub-tab (used by both Launcher Modes)
     $script:PageList = $script:PageAdvShared
-    $g = New-SGroup 'Game clients and windows' 16 164 300 140
+    $g = New-SGroup 'Game Clients and Windows' 16 164 300 140
     $y = 192
     foreach ($k in @('PendingTimeoutSeconds', 'RenameDurationSeconds', 'StatusResetSeconds')) {
         New-SNumRow $g $k 28 205 240 58 $y
         $y += 30
     }
-    $g = New-SGroup 'Clicking Start (launcher / patcher)' 332 164 292 100
+    $g = New-SGroup 'Clicking Start (Launcher / Patcher)' 332 164 292 100
     $y = 192
     foreach ($k in @('PatcherStartPollIntervalMs', 'PatcherStartTimeoutSeconds')) {
         New-SNumRow $g $k 344 210 556 56 $y
@@ -2270,62 +2318,71 @@ function Show-Settings {
 
     # ---- Advanced / Show Arc Mode sub-tab (the old visible pop-up method's timing)
     $script:PageList = $script:PageAdvShow
-    $g = New-SGroup 'Signing in' 16 164 300 200
+    $g = New-SGroup 'Signing In' 16 164 300 200
     $y = 190
     foreach ($k in @('UsernameFocusTabs', 'FieldSeparatorTabs', 'LoginDelayMs', 'MinWaitSeconds', 'WindowTimeoutSeconds')) {
         New-SNumRow $g $k 28 205 240 58 $y
         $y += 30
     }
-    $g = New-SGroup 'Waiting for the game' 332 164 292 62
+    $g = New-SGroup 'Waiting for the Game' 332 164 292 62
     New-SNumRow $g 'TimeoutSeconds' 344 210 556 56 190
-    $g = New-SGroup 'Login pop-up and typing' 16 372 608 104
+    $g = New-SGroup 'Login Pop-Up and Typing' 16 372 608 104
     New-SNumRow $g 'EntersBefore' 28 235 270 50 396
-    [void](New-SLabel $g 'Key for the pop-up' 28 422 120 23)
+    [void](New-SLabel $g 'Key for the Pop-Up' 28 422 120 23)
     [void](New-SRadio $g 'PopEnter' 'Enter' 160 422 70)
     [void](New-SRadio $g 'PopEsc' 'Escape' 240 422 72)
     New-SNumRow $g 'PauseAfterPopupMs' 28 235 270 50 448
     New-SNumRow $g 'ClearBackspaces' 344 210 566 50 396
-    [void](New-SCheck $g 'EnterAfterPassword' 'Press Enter after the password' 344 424 270)
+    [void](New-SCheck $g 'EnterAfterPassword' 'Press Enter After the Password' 344 424 270)
 
     # ---- Advanced / Hidden Arc Mode sub-tab (the hidden sign-in's timing)
     $script:PageList = $script:PageAdvHidden
-    $g = New-SGroup 'Signing in (hidden)' 16 164 300 212
+    $g = New-SGroup 'Signing In (Hidden)' 16 164 300 212
     $y = 188
     foreach ($k in @('HiddenKeyDelayMs', 'HiddenCharDelayMs', 'HiddenPostTabDelayMs', 'HiddenPostFieldDelayMs', 'HiddenHideSettleDelayMs', 'HiddenSignInTimeoutSeconds', 'HiddenSignInPollIntervalMs')) {
         New-SNumRow $g $k 28 205 240 58 $y
         $y += 24
     }
-    $g = New-SGroup 'After sign-in (clicking Play)' 332 164 292 100
+    $g = New-SGroup 'After Sign-In (Clicking Play)' 332 164 292 100
     $y = 190
     foreach ($k in @('HiddenMainWindowInitialDelayMs', 'HiddenMainWindowTimeoutSeconds', 'HiddenMainWindowPollIntervalMs')) {
         New-SNumRow $g $k 344 210 556 56 $y
         $y += 26
     }
-    $g = New-SGroup 'Waiting for the launcher / patcher' 332 276 292 80
+    $g = New-SGroup 'Waiting for the Launcher / Patcher' 332 276 292 80
     New-SNumRow $g 'HiddenPatcherWaitTimeoutSeconds' 344 210 556 56 302
     New-SNumRow $g 'HiddenPatcherWaitPollIntervalMs' 344 210 556 56 330
 
     # ======== page 3: Private Servers
     $script:PageList = $script:PagePriv
-    [void](New-SLabel $dlg 'Used while the switch at the top of the main window is set to Private Servers. Arc is not used in that mode.' 16 108 608 20)
-    $g = New-SGroup 'Program to start' 16 134 608 120
-    [void](New-SLabel $g 'Client or launcher location (it starts in its own folder)' 28 154 400 20)
+    [void](New-SLabel $dlg 'Used while the switch at the top of the main window is set to Private Servers.' 16 108 608 20)
+    $g = New-SGroup 'Program to Start' 16 134 608 170
+    [void](New-SLabel $g 'Client or Launcher Location (it starts in its own folder)' 28 154 400 20)
     [void](New-SEdit $g 'PrivateClientPath' 28 176 496 $false)
     $b3 = New-SButton 'BrowsePriv' 'Browse...' 532 175 80 25
     $g.Controls.Add($b3)
     $b3.SetBounds((532 - $g.Left), (175 - $g.Top), 80, 25)
     $b3.Add_Click({ Browse-Into 'PrivateClientPath' 'Programs (*.exe)|*.exe|All files|*.*' 'Locate the game client or launcher' })
-    [void](New-SLabel $g 'Command-line flags (example: game:cpw nocheck startbypatcher console:1)' 28 202 580 20)
+    [void](New-SLabel $g 'Command-Line Flags (example: game:cpw nocheck startbypatcher console:1)' 28 202 580 20)
     [void](New-SEdit $g 'PrivateFlags' 28 224 584 $false)
-    $g = New-SGroup 'Game client' 16 262 300 180
-    [void](New-SLabel $g 'Process name(s) to wait for (use commas)' 28 282 280 20)
+    [void](New-SLabel $g 'Patcher Location (opened by the Update Client button)' 28 252 340 20)
+    [void](New-SEdit $g 'PrivatePatcherPath' 28 274 340 $false)
+    [void](New-SLabel $g 'Command-Line Flags' 376 252 148 20)   # same line as the location
+    [void](New-SEdit $g 'PrivatePatcherFlags' 376 274 148 $false)
+    $b4 = New-SButton 'BrowsePrivPatcher' 'Browse...' 532 273 80 25
+    $g.Controls.Add($b4)
+    $b4.SetBounds((532 - $g.Left), (273 - $g.Top), 80, 25)
+    $b4.Add_Click({ Browse-Into 'PrivatePatcherPath' 'Programs (*.exe)|*.exe|All files|*.*' "Locate the private server's launcher / patcher" })
+    $script:SYShift = 50   # the groups below move down to make room for the row above
+    $g = New-SGroup 'Game Client' 16 262 300 180
+    [void](New-SLabel $g 'Process Name(s) to Wait for (use commas)' 28 282 280 20)
     [void](New-SEdit $g 'PrivateProcessNames' 28 304 272 $false)
     New-SNumRow $g 'PrivateWindowWaitSeconds' 28 205 240 58 339
     New-SNumRow $g 'PrivateFirstKeyDelaySeconds' 28 205 240 58 367
-    [void](New-SCheck $g 'PrivateEnterAfterPassword' 'Press Enter after the password' 28 396 270)
-    $g = New-SGroup 'Typing sequence' 332 262 292 180
+    [void](New-SCheck $g 'PrivateEnterAfterPassword' 'Press Enter After the Password' 28 396 270)
+    $g = New-SGroup 'Typing Sequence' 332 262 292 180
     New-SNumRow $g 'PrivateEntersBefore' 344 220 566 50 286
-    [void](New-SLabel $g 'Key for the pop-up' 344 314 120 23)
+    [void](New-SLabel $g 'Key for the Pop-Up' 344 314 120 23)
     [void](New-SRadio $g 'PopupEnter' 'Enter' 470 314 70)
     [void](New-SRadio $g 'PopupEsc' 'Escape' 544 314 72)
     $y = 338
@@ -2333,15 +2390,16 @@ function Show-Settings {
         New-SNumRow $g $k 344 220 566 50 $y
         $y += 26
     }
-    [void](New-SCheck $dlg 'PrivateShowWarning' 'Show a warning when switching to Private Servers' 150 452 340)
+    [void](New-SCheck $dlg 'PrivateShowWarning' 'Show a Warning When Switching to Private Servers' 150 452 340)
 
     $script:PageList = $null
+    $script:SYShift = 0
 
     # ======== buttons (always visible)
-    $bd = New-SButton 'Defaults' 'LOAD DEFAULTS' 16 490 130 28
-    $bf = New-SButton 'Folder' 'OPEN SETTINGS FOLDER' 154 490 176 28
-    $bs = New-SButton 'Save' 'SAVE CONFIGURATION' 338 490 184 28
-    $bc = New-SButton 'Cancel' 'CANCEL' 530 490 94 28
+    $bd = New-SButton 'Defaults' 'LOAD DEFAULTS' 16 534 130 28
+    $bf = New-SButton 'Folder' 'OPEN SETTINGS FOLDER' 154 534 176 28
+    $bs = New-SButton 'Save' 'SAVE CONFIGURATION' 338 534 184 28
+    $bc = New-SButton 'Cancel' 'CANCEL' 530 534 94 28
     $bc.DialogResult = 'Cancel'
     $dlg.AcceptButton = $bs
     $dlg.CancelButton = $bc
@@ -2352,9 +2410,9 @@ function Show-Settings {
     })
     $bf.Add_Click({ [void][System.Diagnostics.Process]::Start($ConfigDir) })
     $bs.Add_Click({ Save-Settings })
-    $info = New-SLabel $dlg ('Settings file: ' + $IniFile) 16 530 440 20
+    $info = New-SLabel $dlg ('Settings file: ' + $IniFile) 16 574 440 20
     $info.AutoEllipsis = $true
-    $ver = New-SLabel $dlg (([string][char]169) + ' 2026 Sparc343') 464 530 160 20
+    $ver = New-SLabel $dlg (([string][char]169) + ' 2026 Sparc343') 464 574 160 20
     $ver.TextAlign = 'MiddleRight'
 
     # hover hints
@@ -2403,6 +2461,10 @@ function Show-Settings {
         PrivateTabs = 'Tab presses between the username and the password.'
         PrivateClearBackspaces = 'Backspaces pressed before typing each box, to remove old text (for example a remembered username). 0 = none.'
         PrivateEnterAfterPassword = 'Press Enter after the password to log in.'
+        PatcherPath = "Full path to the game's launcher / patcher. The Update Client button at the top of the main window opens it so you can update the game client. Updates are NOT detected automatically - keep the client up to date yourself."
+        PatcherFlags = 'Command-line flags passed to the patcher, exactly as typed. The patcher needs arc:1 to start Arc (change it here if that ever changes). Never put your password here.'
+        PrivatePatcherFlags = "Command-line flags passed to the private server's patcher, exactly as typed. Never put your password here."
+        PrivatePatcherPath = "Full path to the private server's launcher / patcher. The Update Client button at the top of the main window opens it while PRIVATE Servers is selected. Updates are NOT detected automatically - keep the client up to date yourself."
         ArcPath = 'Full path to Arc.exe. The file must be named Arc.exe. (If it is missing, the manager tries to find it by itself.)'
         Folder = 'Open the folder that holds the settings, accounts and log files.'
         WindowWidth = "Width of the manager window's inside area, in pixels (1040 or more)."
@@ -2581,6 +2643,8 @@ function Show-LogViewer {
     $dlg.Font = New-Object System.Drawing.Font('Segoe UI', 9.5)
     $dlg.ClientSize = New-Object System.Drawing.Size(760, 520)
     $dlg.MinimumSize = New-Object System.Drawing.Size(580, 360)
+    $dlg.KeyPreview = $true
+    $dlg.Add_KeyDown({ param($s, $e) if ($e.KeyCode -eq [System.Windows.Forms.Keys]::F1) { Show-Help; $e.Handled = $true; $e.SuppressKeyPress = $true } })   # F1: the built-in help
 
     $cur = New-Object System.Windows.Forms.RadioButton
     $cur.Text = 'This run'
@@ -2688,7 +2752,28 @@ $modeBtn.BackColor = $cBox
 $modeBtn.Add_Paint({ param($s, $e) Paint-ModeSwitch $s $e })
 $modeBtn.Add_Click({ Set-PrivateMode (-not [bool]$PrivateMode) })
 $form.Controls.Add($modeBtn)
-$form.Add_Resize({ $modeBtn.Left = [math]::Max(230, [int](($form.ClientSize.Width - 240) / 2)) })
+# the Update Client button sits half-way between the "PWI" title and the OFFICIAL | PRIVATE switch
+function Get-UpdateBtnLeft {
+    $switchLeft = [math]::Max(230, [int](($form.ClientSize.Width - 240) / 2))
+    return [int]((16 + $title.PreferredWidth + $switchLeft) / 2 - 65)
+}
+$updBtn = New-Object System.Windows.Forms.Button
+$updBtn.Text = 'Update Client'
+$updBtn.FlatStyle = 'Flat'
+$updBtn.FlatAppearance.BorderSize = 0
+$updBtn.Font = New-Object System.Drawing.Font('Segoe UI', 9.5, [System.Drawing.FontStyle]::Bold)
+$updBtn.Size = New-Object System.Drawing.Size(130, 36)
+$updBtn.Location = New-Object System.Drawing.Point((Get-UpdateBtnLeft), 14)
+$updBtn.Anchor = 'Top'
+$updBtn.BackColor = [System.Drawing.Color]::FromArgb(40, 150, 75)
+$updBtn.ForeColor = [System.Drawing.Color]::White
+$updBtn.UseVisualStyleBackColor = $false
+$updBtn.Add_Click({ Start-UpdateClient })
+$form.Controls.Add($updBtn)
+$form.Add_Resize({
+    $modeBtn.Left = [math]::Max(230, [int](($form.ClientSize.Width - 240) / 2))
+    $updBtn.Left = (Get-UpdateBtnLeft)
+})
 $title.BackColor = [System.Drawing.Color]::Transparent
 $form.Controls.Add($title)
 
@@ -2731,7 +2816,7 @@ function Guard-TextBox($box) {
     })
 }
 # ---- the minus button of a row (grey, red when hovered; red with a ring when selected)
-$script:DelTipText = "CLICK to delete (with confirmation)`nSHIFT+CLICK to delete (without confirmation)`nCONTROL+CLICK to select several rows to delete,`n      then ALT+D to delete them`nBlank entries are also deleted on exit"
+$script:DelTipText = "CLICK to delete (with confirmation)`nSHIFT+CLICK to delete (without confirmation)`nCONTROL+CLICK to select several rows to delete,`n      then ALT+D to delete them`nALT+A selects ALL rows (then ALT+D to delete them)`nBlank entries are also deleted on exit"
 $script:HotDel = $null
 $script:GripTipText = "DRAG up or down to move this account to a new place`n(ESC while dragging cancels)`nOr press ALT+UP / ALT+DOWN while the cursor is in`n      any box of this row to move it one place"
 # the drag handle of a row: three lines (grey, blue when hovered or dragged)
@@ -3111,6 +3196,474 @@ function Delete-Selected {
     After-Delete
 }
 
+# ---- the Update Client button: opens the game's launcher / patcher (visible, never hidden) so the person can update the
+# game client by hand. Works without signing in. Updates are never detected automatically.
+function Test-SignInBusy {
+    if ($script:Active -ne $null) { return $true }
+    return (@($script:Rows | Where-Object { $_.Pending -ne $null }).Count -gt 0)
+}
+# greyed out while a sign-in is in progress: a patcher started now could be mistaken for the sign-in's own launcher/patcher
+function Update-UpdateButton {
+    if ($updBtn -eq $null) { return }
+    $ok = (-not (Test-SignInBusy))
+    if ($updBtn.Enabled -ne $ok) {
+        $updBtn.Enabled = $ok
+        if ($ok) { $updBtn.BackColor = [System.Drawing.Color]::FromArgb(40, 150, 75); $updBtn.ForeColor = [System.Drawing.Color]::White }
+        else { $updBtn.BackColor = [System.Drawing.Color]::FromArgb(32, 87, 49); $updBtn.ForeColor = [System.Drawing.Color]::FromArgb(110, 110, 118) }
+    }
+}
+function Start-UpdateClient {
+    if (Test-SignInBusy) {
+        [void][System.Windows.Forms.MessageBox]::Show($form, 'A sign-in is in progress. Wait for it to finish, or cancel it first.', 'Update Client', 'OK', 'Information')
+        return
+    }
+    $path = $PatcherPath
+    if ($PrivateMode) { $path = $PrivatePatcherPath }
+    if ($path -eq '' -or -not (Test-Path -LiteralPath $path)) {
+        if ($path -eq '') { $m = 'The Patcher Location is not set yet.' } else { $m = "The patcher was not found at:`n" + $path }
+        if ($PrivateMode) { $m += "`n`nSet it with the gear icon > Private Servers > Patcher location." }
+        else { $m += "`n`nSet it with the gear icon > Basic > Patcher Location." }
+        [void][System.Windows.Forms.MessageBox]::Show($form, $m, 'Update Client', 'OK', 'Information')
+        return
+    }
+    try {
+        $flags = $PatcherFlags
+        if ($PrivateMode) { $flags = $PrivatePatcherFlags }
+        if ($flags -ne '') { Start-Process -FilePath $path -ArgumentList $flags -WorkingDirectory (Split-Path -Parent $path) }   # the flags are passed exactly as typed (arc:1 makes the patcher start Arc)
+        else { Start-Process -FilePath $path -WorkingDirectory (Split-Path -Parent $path) }   # the patcher starts in its own folder
+        Write-Log ('Update Client: started ' + $path)
+    } catch {
+        [void][System.Windows.Forms.MessageBox]::Show($form, ("The patcher could not be started:`n" + $_.Exception.Message + "`n`nCheck the Patcher Location in the settings."), 'Update Client', 'OK', 'Warning')
+    }
+}
+# ALT+A: select every row that can be deleted (the same marking CONTROL+CLICK does), then ALT+D deletes them (after asking)
+function Select-AllRows {
+    if ($script:Active -ne $null) { return }   # rows cannot be deleted while a sign-in runs
+    foreach ($r in $script:Rows) {
+        if ((Test-RowBusy $r) -or $r.Selected) { continue }
+        $r.Selected = $true
+        $r.Del.Invalidate()
+    }
+    Update-SelectionHint
+}
+
+# ---- built-in help (F1): the README is stored as a text block at the very END of this file (between two marker lines)
+# and shown formatted (converted to RTF for a RichTextBox), so this one file is enough. (Keep it in step with README.md when releasing.)
+function Get-EmbeddedReadme {
+    try {
+        $text = [System.IO.File]::ReadAllText($ScriptPath)
+        $begin = 'BUILTIN-READ' + 'ME-BEGIN'   # (written in two pieces so that this line itself is not mistaken for the marker)
+        $end = 'BUILTIN-READ' + 'ME-END'
+        $i = $text.LastIndexOf($begin)
+        if ($i -lt 0) { return '' }
+        $i = $i + $begin.Length
+        $j = $text.IndexOf($end, $i)
+        if ($j -lt 0) { return '' }
+        return $text.Substring($i, $j - $i).Trim()
+    } catch { return '' }
+}
+# --- Markdown -> RTF: the help is drawn in a RichTextBox (headings, bold/italic, lists, code, tables, clickable links)
+function ConvertTo-RtfPlain([string]$t) {   # escapes \ { } and non-ASCII characters (only those are touched, so this is quick)
+    $ev = [System.Text.RegularExpressions.MatchEvaluator]{
+        param($m)
+        $v = $m.Value
+        $c = [int][char]$v
+        if ($c -lt 128) { return ('\' + $v) }
+        if ($c -gt 32767) { $c = $c - 65536 }
+        return ('\u' + [string]$c + '?')
+    }
+    return [regex]::Replace($t, '[\\{}]|[^\x00-\x7F]', $ev)
+}
+function ConvertTo-RtfInline([string]$in) {
+    $t = $in.Replace('\|', '|')
+    $ev = [System.Text.RegularExpressions.MatchEvaluator]{
+        param($m)
+        $u = $m.Groups[2].Value
+        if ($u.StartsWith('#')) { return $m.Groups[1].Value }
+        if ($m.Groups[1].Value -eq $u) { return $u }
+        return ($m.Groups[1].Value + ' (' + $u + ')')
+    }
+    $t = [regex]::Replace($t, '\[([^\]]*)\]\(([^)]*)\)', $ev)   # [text](url) -> text (url): the url part becomes a clickable link by itself
+    $t = ConvertTo-RtfPlain $t   # (escaped once up front; the markers looked for below are not affected)
+    $sb = New-Object System.Text.StringBuilder
+    $code = $false
+    $bold = $false
+    $ital = $false
+    $n = $t.Length
+    $i = 0
+    while ($i -lt $n) {
+        $c = [string]$t[$i]
+        if ($c -eq [string][char]96) {   # ` starts / ends code
+            if ($code) { [void]$sb.Append('}'); $code = $false } else { [void]$sb.Append('{\f1\fs19\cf3 '); $code = $true }
+            $i++
+            continue
+        }
+        if ($code) { [void]$sb.Append($c); $i++; continue }
+        if ($c -eq '*') {
+            if (($i + 1 -lt $n) -and ($t[$i + 1] -eq [char]42)) {
+                $bold = (-not $bold)
+                if ($bold) { [void]$sb.Append('\b ') } else { [void]$sb.Append('\b0 ') }
+                $i += 2
+                continue
+            }
+            $prev = ' '
+            if ($i -gt 0) { $prev = [string]$t[$i - 1] }
+            $nxt = ' '
+            if ($i + 1 -lt $n) { $nxt = [string]$t[$i + 1] }
+            $opening = (($prev -eq ' ') -or ($prev -eq '(') -or ($prev -eq '[')) -and ($nxt -ne ' ')
+            $closing = ($prev -ne ' ') -and (' .,;:)!?'.IndexOf($nxt) -ge 0)
+            if ($opening -or $closing) {
+                $ital = (-not $ital)
+                if ($ital) { [void]$sb.Append('\i ') } else { [void]$sb.Append('\i0 ') }
+                $i++
+                continue
+            }
+        }
+        [void]$sb.Append($c)
+        $i++
+    }
+    if ($code) { [void]$sb.Append('}') }
+    if ($bold) { [void]$sb.Append('\b0 ') }
+    if ($ital) { [void]$sb.Append('\i0 ') }
+    return $sb.ToString()
+}
+# --- table cells: text with its styles (1 = code, 2 = bold, 8 = italic) so a cell can be wrapped to a column width
+function ConvertTo-MdRuns([string]$in) {
+    $t = $in.Replace('\|', '|')
+    $ev = [System.Text.RegularExpressions.MatchEvaluator]{
+        param($m)
+        $u = $m.Groups[2].Value
+        if ($u.StartsWith('#')) { return $m.Groups[1].Value }
+        if ($m.Groups[1].Value -eq $u) { return $u }
+        return ($m.Groups[1].Value + ' (' + $u + ')')
+    }
+    $t = [regex]::Replace($t, '\[([^\]]*)\]\(([^)]*)\)', $ev)
+    $pl = New-Object System.Text.StringBuilder
+    $sty = New-Object System.Collections.ArrayList
+    $code = $false
+    $bold = $false
+    $ital = $false
+    $n = $t.Length
+    $i = 0
+    while ($i -lt $n) {
+        $c = [string]$t[$i]
+        if ($c -eq [string][char]96) { $code = (-not $code); $i++; continue }
+        if ($code) { [void]$pl.Append($c); [void]$sty.Add(1); $i++; continue }
+        if ($c -eq '*') {
+            if (($i + 1 -lt $n) -and ($t[$i + 1] -eq [char]42)) { $bold = (-not $bold); $i += 2; continue }
+            $prev = ' '
+            if ($i -gt 0) { $prev = [string]$t[$i - 1] }
+            $nxt = ' '
+            if ($i + 1 -lt $n) { $nxt = [string]$t[$i + 1] }
+            $opening = (($prev -eq ' ') -or ($prev -eq '(') -or ($prev -eq '[')) -and ($nxt -ne ' ')
+            $closing = ($prev -ne ' ') -and (' .,;:)!?'.IndexOf($nxt) -ge 0)
+            if ($opening -or $closing) { $ital = (-not $ital); $i++; continue }
+        }
+        $f = 0
+        if ($bold) { $f = $f + 2 }
+        if ($ital) { $f = $f + 8 }
+        [void]$pl.Append($c)
+        [void]$sty.Add($f)
+        $i++
+    }
+    return @{ Text = $pl.ToString(); Sty = $sty }
+}
+function Get-WrapLines([string]$pl, [int]$w) {   # start/end positions of the lines when $pl is wrapped at $w characters
+    $lines = New-Object System.Collections.ArrayList
+    $i = 0
+    $n = $pl.Length
+    while ($i -lt $n) {
+        if ($i -gt 0) { while (($i -lt $n) -and ($pl[$i] -eq ' ')) { $i++ } }
+        if ($i -ge $n) { break }
+        $j = [math]::Min($n, $i + $w)
+        if ($j -lt $n) {
+            $k = $j
+            while (($k -gt $i) -and ($pl[$k] -ne ' ')) { $k-- }
+            if ($k -gt $i) { $j = $k }
+        }
+        $e = $j
+        while (($e -gt $i) -and ($pl[$e - 1] -eq ' ')) { $e-- }
+        [void]$lines.Add(@($i, $e))
+        $i = $j
+    }
+    if ($lines.Count -eq 0) { [void]$lines.Add(@(0, 0)) }
+    return ,$lines
+}
+function ConvertTo-RunsRtf([string]$pl, $sty, [int]$i, [int]$e, [bool]$hdr) {
+    $sb = New-Object System.Text.StringBuilder
+    $k = $i
+    while ($k -lt $e) {
+        $m = $k
+        while (($m -lt $e) -and ($sty[$m] -eq $sty[$k])) { $m++ }
+        $f = [int]$sty[$k]
+        $pre = ''
+        if ((($f -band 2) -ne 0) -or $hdr) { $pre = $pre + '\b ' }
+        if (($f -band 8) -ne 0) { $pre = $pre + '\i ' }
+        if (($f -band 1) -ne 0) { $pre = $pre + '\cf3 ' }
+        $txt = ConvertTo-RtfPlain ($pl.Substring($k, $m - $k))
+        if ($pre -ne '') { [void]$sb.Append('{' + $pre + $txt + '}') } else { [void]$sb.Append($txt) }
+        $k = $m
+    }
+    return $sb.ToString()
+}
+function ConvertTo-MdRtf([string]$md, [int]$tableTwips) {
+    $blocks = New-Object System.Collections.ArrayList
+    $cur = $null
+    $inCode = $false
+    foreach ($raw in $md.Replace("`r`n", "`n").Split("`n")) {
+        $l = $raw.TrimEnd()
+        $st = $l.TrimStart()
+        $ind = $l.Length - $st.Length
+        if ($inCode) {
+            if ($st.StartsWith('```')) { $inCode = $false; [void]$blocks.Add($cur); $cur = $null } else { [void]$cur.Lines.Add($l) }
+            continue
+        }
+        if ($st.StartsWith('```')) {
+            if ($cur -ne $null) { [void]$blocks.Add($cur); $cur = $null }
+            $inCode = $true
+            $cur = @{ T = 'code'; Lines = (New-Object System.Collections.ArrayList) }
+            continue
+        }
+        if ($st -eq '') { if ($cur -ne $null) { [void]$blocks.Add($cur); $cur = $null }; continue }
+        if ($st.StartsWith('|')) {
+            if (($cur -eq $null) -or ($cur.T -ne 'table')) {
+                if ($cur -ne $null) { [void]$blocks.Add($cur) }
+                $cur = @{ T = 'table'; Rows = (New-Object System.Collections.ArrayList) }
+            }
+            $cells = @($st.Trim('|').Split('|') | ForEach-Object { $_.Trim() })
+            $sep = $true
+            foreach ($c in $cells) { if (-not ($c -match '^[-:]{3,}$')) { $sep = $false; break } }
+            if (-not $sep) { [void]$cur.Rows.Add($cells) }
+            continue
+        }
+        if (($cur -ne $null) -and ($cur.T -eq 'table')) { [void]$blocks.Add($cur); $cur = $null }
+        if ($st.StartsWith('#')) {
+            if ($cur -ne $null) { [void]$blocks.Add($cur); $cur = $null }
+            $rest = $st.TrimStart('#')
+            [void]$blocks.Add(@{ T = 'h'; L = ($st.Length - $rest.Length); Text = $rest.Trim() })
+            continue
+        }
+        if ($st -match '^(-{3,}|\*{3,})$') {
+            if ($cur -ne $null) { [void]$blocks.Add($cur); $cur = $null }
+            [void]$blocks.Add(@{ T = 'hr' })
+            continue
+        }
+        if ($st.StartsWith('>')) {
+            $q = $st.Substring(1)
+            if ($q.StartsWith(' ')) { $q = $q.Substring(1) }
+            if (($cur -ne $null) -and ($cur.T -eq 'q')) { $cur.Text = $cur.Text + ' ' + $q }
+            else {
+                if ($cur -ne $null) { [void]$blocks.Add($cur) }
+                $cur = @{ T = 'q'; Text = $q }
+            }
+            continue
+        }
+        if ($st -match '^([-*]|\d+\.) (.*)$') {
+            if ($cur -ne $null) { [void]$blocks.Add($cur) }
+            $cur = @{ T = 'li'; Ind = $ind; Mark = $matches[1]; Text = $matches[2] }
+            continue
+        }
+        if (($cur -ne $null) -and (($cur.T -eq 'p') -or ($cur.T -eq 'li') -or ($cur.T -eq 'q'))) { $cur.Text = $cur.Text + ' ' + $st }
+        else {
+            if ($cur -ne $null) { [void]$blocks.Add($cur) }
+            $cur = @{ T = 'p'; Text = $st }
+        }
+    }
+    if ($cur -ne $null) { [void]$blocks.Add($cur) }
+
+    $sans = 'Segoe UI'
+    try { $null = New-Object System.Drawing.FontFamily('Segoe UI') } catch { $sans = 'Tahoma' }
+    $mono = 'Consolas'
+    try { $null = New-Object System.Drawing.FontFamily('Consolas') } catch { $mono = 'Courier New' }
+    $P = 140
+    $cw = 116   # width of one character of the fixed-width font, in twips (Courier New)
+    if ($mono -eq 'Consolas') { $cw = 106 }
+    $base = '\plain\f0\fs20\cf1'
+    $o = New-Object System.Text.StringBuilder
+    [void]$o.Append('{\rtf1\ansi\ansicpg1252\deff0{\fonttbl{\f0\fnil\fcharset0 ' + $sans + ';}{\f1\fnil\fcharset0 ' + $mono + ';}}')
+    [void]$o.Append('{\colortbl ;\red36\green41\blue46;\red3\green102\blue214;\red138\green75\blue8;\red106\green115\blue125;\red208\green215\blue222;\red240\green241\blue243;}\viewkind4\uc1 ')
+    $brd = '\brdrs\brdrw10\brdrcf5'
+    foreach ($b in $blocks) {
+        $kind = $b.T
+        if ($kind -eq 'h') {
+            $fs = 22
+            if ($b.L -eq 1) { $fs = 38 } elseif ($b.L -eq 2) { $fs = 30 } elseif ($b.L -eq 3) { $fs = 25 }
+            $line = ''
+            if ($b.L -le 2) { $line = '\brdrb\brsp40' + $brd }
+            [void]$o.Append('\pard' + $line + '\li' + $P + '\ri' + $P + '\sb240\sa100 \f0\fs' + $fs + '\cf1\b ' + (ConvertTo-RtfInline $b.Text) + '\b0\par' + "`r`n")
+        }
+        elseif ($kind -eq 'p') {
+            [void]$o.Append('\pard' + $base + '\li' + $P + '\ri' + $P + '\sa120 ' + (ConvertTo-RtfInline $b.Text) + '\par' + "`r`n")
+        }
+        elseif ($kind -eq 'li') {
+            $liLeft = $P + 300 + ([int][math]::Floor($b.Ind / 2)) * 280
+            if (($b.Mark -eq '-') -or ($b.Mark -eq '*')) { $mark = '\bullet ' } else { $mark = (ConvertTo-RtfPlain $b.Mark) }
+            [void]$o.Append('\pard' + $base + '\fi-260\li' + $liLeft + '\ri' + $P + '\tx' + $liLeft + '\sa40 ' + $mark + '\tab ' + (ConvertTo-RtfInline $b.Text) + '\par' + "`r`n")
+        }
+        elseif ($kind -eq 'q') {
+            [void]$o.Append('\pard\plain\f0\fs20\cf4\li' + ($P + 300) + '\ri' + $P + '\sa120 \i ' + (ConvertTo-RtfInline $b.Text) + '\i0\par' + "`r`n")
+        }
+        elseif ($kind -eq 'code') {
+            $cnt = $b.Lines.Count
+            for ($k = 0; $k -lt $cnt; $k++) {
+                $sa = 0
+                if ($k -eq ($cnt - 1)) { $sa = 120 }
+                [void]$o.Append('\pard\plain\f1\fs19\cf3\li' + ($P + 240) + '\ri' + $P + '\sa' + $sa + ' ' + (ConvertTo-RtfPlain $b.Lines[$k]) + '\par' + "`r`n")
+            }
+        }
+        elseif ($kind -eq 'hr') {
+            [void]$o.Append('\pard\plain\fs8\li' + $P + '\ri' + $P + '\sb60\sa120\brdrb\brsp20' + $brd + '\par' + "`r`n")
+        }
+        elseif ($kind -eq 'table') {
+            # drawn as a text grid in the fixed-width font (RichTextBox cannot wrap text inside real table cells)
+            $cols = 0
+            foreach ($r in $b.Rows) { if ($r.Count -gt $cols) { $cols = $r.Count } }
+            if ($cols -eq 0) { continue }
+            $grid = New-Object System.Collections.ArrayList
+            foreach ($r in $b.Rows) {
+                $rr = @()
+                for ($ci = 0; $ci -lt $cols; $ci++) {
+                    $cell = ''
+                    if ($ci -lt $r.Count) { $cell = [string]$r[$ci] }
+                    $rr += ,(ConvertTo-MdRuns $cell)
+                }
+                [void]$grid.Add($rr)
+            }
+            $nat = New-Object 'int[]' $cols
+            $natSum = 0
+            $narrowSum = 0
+            $wideCount = 0
+            $wideWeight = 0
+            for ($ci = 0; $ci -lt $cols; $ci++) {
+                $m = 6
+                foreach ($rr in $grid) { if ($rr[$ci].Text.Length -gt $m) { $m = $rr[$ci].Text.Length } }
+                $nat[$ci] = $m
+                $natSum += $m
+                if ($m -le 22) { $narrowSum += $m } else { $wideCount++; $wideWeight += [math]::Min($m, 300) }
+            }
+            $avail = [int][math]::Floor($tableTwips / $cw) - (3 * $cols + 1)
+            $wd = New-Object 'int[]' $cols
+            $rem = $avail - $narrowSum
+            for ($ci = 0; $ci -lt $cols; $ci++) {
+                if ($natSum -le $avail) { $wd[$ci] = $nat[$ci] }
+                elseif (($wideCount -eq 0) -or ($rem -lt (14 * $wideCount))) { $wd[$ci] = [math]::Max(6, [int][math]::Floor($nat[$ci] * $avail / $natSum)) }
+                elseif ($nat[$ci] -le 22) { $wd[$ci] = $nat[$ci] }
+                else { $wd[$ci] = [math]::Max(14, [int][math]::Floor($rem * [math]::Min($nat[$ci], 300) / $wideWeight)) }
+            }
+            $dashes = @()
+            for ($ci = 0; $ci -lt $cols; $ci++) { $dashes += ('-' * ($wd[$ci] + 2)) }
+            $sep = '\pard\plain\f1\fs19\cf5\li' + $P + '\ri' + $P + '\sa0 +' + ($dashes -join '+') + '+\par' + "`r`n"
+            $lead = '\pard\plain\f1\fs19\cf1\li' + $P + '\ri' + $P + '\sa0 {\cf5 |}'
+            [void]$o.Append($sep)
+            for ($ri = 0; $ri -lt $grid.Count; $ri++) {
+                $rr = $grid[$ri]
+                $wr = @()
+                $nl = 1
+                for ($ci = 0; $ci -lt $cols; $ci++) {
+                    $wl = Get-WrapLines $rr[$ci].Text $wd[$ci]
+                    $wr += ,$wl
+                    if ($wl.Count -gt $nl) { $nl = $wl.Count }
+                }
+                for ($li = 0; $li -lt $nl; $li++) {
+                    $line = $lead
+                    for ($ci = 0; $ci -lt $cols; $ci++) {
+                        $txt = ''
+                        $len = 0
+                        if ($li -lt $wr[$ci].Count) {
+                            $pair = $wr[$ci][$li]
+                            $txt = ConvertTo-RunsRtf $rr[$ci].Text $rr[$ci].Sty $pair[0] $pair[1] ($ri -eq 0)
+                            $len = $pair[1] - $pair[0]
+                        }
+                        $line = $line + ' ' + $txt + (' ' * [math]::Max(0, ($wd[$ci] - $len))) + ' {\cf5 |}'
+                    }
+                    [void]$o.Append($line + '\par' + "`r`n")
+                }
+                [void]$o.Append($sep)
+            }
+            [void]$o.Append('\pard\plain\fs10\par' + "`r`n")
+        }
+    }
+    [void]$o.Append('}')
+    return $o.ToString()
+}
+$script:HelpDlg = $null
+function Set-HelpText {
+    $tw = ($script:HelpRtb.ClientSize.Width - 36) * 15 - 280
+    if ($tw -lt 3000) { $tw = 3000 }
+    $script:HelpTw = $tw
+    $help = Get-EmbeddedReadme
+    if ($help -eq '') { $script:HelpRtb.Text = 'The built-in help is missing from this script.' }
+    else { $script:HelpRtb.Rtf = (ConvertTo-MdRtf $help $tw) }
+}
+function Show-Help {
+    if ($script:HelpDlg -ne $null -and -not $script:HelpDlg.IsDisposed) {
+        if ($script:HelpDlg.WindowState -eq 'Minimized') { $script:HelpDlg.WindowState = 'Normal' }
+        $script:HelpDlg.Activate()
+        return
+    }
+    $dlg = New-Object System.Windows.Forms.Form
+    $script:HelpDlg = $dlg
+    $dlg.Text = 'ArcManager - Help (README)'
+    $dlg.AutoScaleMode = 'None'
+    $dlg.Font = New-Object System.Drawing.Font('Segoe UI', 9.5)
+    $dlg.MinimumSize = New-Object System.Drawing.Size(500, 340)
+    # the help opens with exactly the size and position of the main window (so the whole README width is visible)
+    $b = $form.Bounds
+    if ($form.WindowState -eq 'Minimized') { $b = $form.RestoreBounds }
+    $dlg.StartPosition = 'Manual'
+    $dlg.Location = $b.Location
+    $dlg.Size = $b.Size
+    $rtb = New-Object System.Windows.Forms.RichTextBox
+    $rtb.ReadOnly = $true
+    $rtb.BackColor = [System.Drawing.Color]::White
+    $rtb.BorderStyle = 'FixedSingle'
+    $rtb.DetectUrls = $true
+    $rtb.HideSelection = $false
+    $rtb.WordWrap = $true
+    $rtb.ScrollBars = 'Vertical'
+    $rtb.TabStop = $true
+    $close = New-Object System.Windows.Forms.Button
+    $close.Text = 'CLOSE'
+    $close.Size = New-Object System.Drawing.Size(100, 28)
+    $dlg.Controls.AddRange(@($rtb, $close))
+    $rtb.Location = New-Object System.Drawing.Point(8, 8)
+    $rtb.Size = New-Object System.Drawing.Size(($dlg.ClientSize.Width - 16), ($dlg.ClientSize.Height - 52))
+    $rtb.Anchor = 'Top,Bottom,Left,Right'
+    $close.Location = New-Object System.Drawing.Point(($dlg.ClientSize.Width - 8 - 100), ($dlg.ClientSize.Height - 8 - 28))
+    $close.Anchor = 'Bottom,Right'
+    $dlg.CancelButton = $close   # Esc closes the help
+    $script:HelpRtb = $rtb   # (event handlers run later, when the local variables of this function are gone)
+    $script:HelpLastState = $dlg.WindowState
+    Set-HelpText
+    $close.Add_Click({ $script:HelpDlg.Close() })
+    $rtb.Add_LinkClicked({
+        param($s, $e)
+        if ($e.LinkText -match '^(https?://|mailto:)') { try { [void][System.Diagnostics.Process]::Start($e.LinkText) } catch { } }
+    })
+    $redraw = {
+        if ($script:HelpDlg -eq $null -or $script:HelpDlg.IsDisposed) { return }
+        $newTw = ($script:HelpRtb.ClientSize.Width - 36) * 15 - 280
+        if ([math]::Abs($newTw - $script:HelpTw) -lt 300) { return }
+        $ci = $script:HelpRtb.GetCharIndexFromPosition((New-Object System.Drawing.Point(5, 5)))   # keep the reading position
+        Set-HelpText
+        $script:HelpRtb.Select($ci, 0)
+        $script:HelpRtb.ScrollToCaret()
+    }
+    $script:HelpRedraw = $redraw
+    $dlg.Add_ResizeEnd({ & $script:HelpRedraw })
+    $dlg.Add_SizeChanged({
+        if ($script:HelpDlg -ne $null -and $script:HelpDlg.WindowState -ne $script:HelpLastState) { $script:HelpLastState = $script:HelpDlg.WindowState; & $script:HelpRedraw }
+    })
+    $dlg.Add_Shown({ $script:HelpRtb.SelectionStart = 0; $script:HelpRtb.SelectionLength = 0; $script:HelpRtb.Focus() })
+    $dlg.Add_FormClosed({
+        $script:HelpDlg = $null
+        if ($script:SetDlg -ne $null -and -not $script:SetDlg.IsDisposed) { $script:SetDlg.Activate() } else { $form.Activate() }
+    })
+    $owner = $form
+    if ($script:SetDlg -ne $null -and -not $script:SetDlg.IsDisposed -and $script:SetDlg.Visible) { $owner = $script:SetDlg }
+    $dlg.Show($owner)
+}
+
 foreach ($acc in $accounts) { Add-Row $acc.User $acc.Pass $acc.Notes }
 Adopt-Session
 
@@ -3308,6 +3861,18 @@ $showPw.Add_CheckedChanged({
 })
 $form.Controls.Add($showPw)
 
+# "Help~F1" (upper right corner)
+$f1Label = New-Object System.Windows.Forms.Label
+$f1Label.Text = 'Help~F1'
+$f1Label.UseMnemonic = $false
+$f1Label.ForeColor = $cGray
+$f1Label.AutoSize = $false
+$f1Label.BackColor = [System.Drawing.Color]::Transparent
+$f1Label.Anchor = 'Top,Right'
+$f1Label.TextAlign = 'MiddleRight'
+$f1Label.Size = New-Object System.Drawing.Size(56, 20)
+$f1Label.Location = New-Object System.Drawing.Point(($form.ClientSize.Width - 16 - 56), 14)   # upper right corner
+$form.Controls.Add($f1Label)
 # the plain-text warning scrolls when there is not enough room for it
 $hintPanel = New-Object System.Windows.Forms.Panel
 $hintPanel.BackColor = [System.Drawing.Color]::Transparent
@@ -3384,7 +3949,8 @@ $logBtn.Add_MouseLeave({ $script:LogHot = $false; $logBtn.Invalidate() })
 $logBtn.Add_Click({ Show-LogViewer })
 $form.Controls.Add($logBtn)
 $script:TipMain = New-Object System.Windows.Forms.ToolTip
-$script:TipMain.SetToolTip($gearBtn, 'Settings')
+$script:TipMain.SetToolTip($gearBtn, 'Settings   (F1 = Help)')
+$script:TipMain.SetToolTip($updBtn, "Opens the game's launcher / patcher so you can update the game client (no sign-in needed). Updates are NOT detected automatically - keep the client up to date yourself. Set the location with the gear icon (Basic page for OFFICIAL, Private Servers page for PRIVATE).")
 foreach ($r in $script:Rows) {
     $script:TipMain.SetToolTip($r.Del, $script:DelTipText)
     $script:TipMain.SetToolTip($r.Grip, $script:GripTipText)
@@ -3406,7 +3972,7 @@ $script:ToolHideTimer.Start()
 
 $timer = New-Object System.Windows.Forms.Timer
 $timer.Interval = 1000
-$timer.Add_Tick({ Update-State; Expire-Statuses; Update-DeleteButtons; Save-Session; Apply-WindowTitles })
+$timer.Add_Tick({ Update-State; Expire-Statuses; Update-DeleteButtons; Save-Session; Apply-WindowTitles; Update-UpdateButton })
 $timer.Start()
 
 $script:LastState = $form.WindowState
@@ -3419,6 +3985,8 @@ $form.Add_KeyDown({
     param($s, $e)
     if (($script:Drag -ne $null) -and $e.KeyCode -eq [System.Windows.Forms.Keys]::Escape) { End-Drag $false; $e.Handled = $true; $e.SuppressKeyPress = $true }   # ESC cancels a drag
     elseif ($e.Alt -and $e.KeyCode -eq [System.Windows.Forms.Keys]::D) { Delete-Selected; $e.Handled = $true; $e.SuppressKeyPress = $true }   # ALT+D
+    elseif ($e.Alt -and $e.KeyCode -eq [System.Windows.Forms.Keys]::A) { Select-AllRows; $e.Handled = $true; $e.SuppressKeyPress = $true }   # ALT+A: select all rows
+    elseif ($e.KeyCode -eq [System.Windows.Forms.Keys]::F1) { Show-Help; $e.Handled = $true; $e.SuppressKeyPress = $true }   # F1: the built-in help (the README)
     elseif ($e.Alt -and ($e.KeyCode -eq [System.Windows.Forms.Keys]::Up -or $e.KeyCode -eq [System.Windows.Forms.Keys]::Down) -and ($script:Drag -eq $null)) {   # ALT+UP / ALT+DOWN: move the row that has the cursor
         $c = $form.ActiveControl
         while (($c -is [System.Windows.Forms.ContainerControl]) -and ($c.ActiveControl -ne $null)) { $c = $c.ActiveControl }
@@ -4610,4 +5178,350 @@ AABgTAACAAAAwJgABAAAAIAxAQgAAAAAYwIQAAAAAMYEIAAAAACMCUAAAAAAGBOAAAAAADAmAAEAAABg
 AQgAAAAAYwIQAAAAAMYEIAAAAACMCUAAAAAAGBOAAAAAADAmAAEAAABgTAACAAAAwJgABAAAAIAxAQgAAAAAYwIQAAAAAMYEIAAA
 AACMCUAAAAAAGAuDx3c3IAOGbwAAAABJRU5ErkJggg==
 BUILTIN-BACKGROUND-END
+BUILTIN-README-BEGIN
+# ArcManager - PWI Account Manager
+
+A small, portable helper for people who play **Perfect World International** through the **Arc** launcher
+on several accounts. Keep your accounts in one window, press **SIGN IN**, and the manager starts Arc, types the
+login for you, lets the game launch, and closes Arc again so the next account can sign in. It can even press Arc's **Play** and the patcher's **Start** for you, so one click on **SIGN IN** takes you all the way to the open game client.
+
+> **Unofficial.** This project is not made, endorsed or supported by Arc, Perfect World, Gameforge or any other
+> company. All names and trademarks belong to their owners. You use it at your own risk; please check the game's
+> Terms of Service yourself.
+
+Two versions are provided. They do the same thing and **share the same settings and accounts files**:
+
+| Version | File | Needs |
+|---|---|---|
+| **C++ (native)** | `ArcManager.exe` | Nothing to install. A single small file. |
+| **PowerShell** | `ArcManager.ps1` + `StartArcManager.bat` | Windows with PowerShell 2.0 or newer (included in Windows 7 and later). |
+
+Both run only one copy at a time (you cannot start the C++ and PowerShell versions together).
+
+---
+
+## Features
+
+- Any number of accounts, each with **username, password and a note** (for example the character name).
+- **One-click sign-in**: closes any old Arc, starts Arc, signs in, and takes you to the running game client. Two **Launcher Modes** (see *Launcher Modes and automation* below): **Hidden Arc Mode** (the default; Arc's window is kept off-screen) or **Show Arc Mode** (Arc's window is shown and the login is typed into it).
+- **Optional full automation** (Show Arc Mode): *Auto-click Play (arc)* and *Auto-click Start (launcher/patcher)* press those two buttons for you. Hidden Arc Mode always clicks both.
+- Closes Arc **the instant the launcher / patcher is detected** (no delay or choice settings any more), and force-closes the launcher / patcher itself the instant the game client starts.
+- Small always-on-top status pop-ups (**Obtaining ARC / PWI TOKEN Now** and **Starting Game**) so you always know the program is busy. The *Starting Game* pop-up also reminds you to check for updates manually if the start fails.
+- An **Update Client** button (green, at the top of the window) that opens the game's launcher / patcher without signing in to anything, so you can update the game client. **Updates are never detected automatically - you have to do them yourself** (see *Updating the game client (manual)* below).
+- **CANCEL** (the SIGN IN button turns into CANCEL while working) closes Arc, the launcher and the patcher that this sign-in started.
+- **STOP** closes that account's game client.
+- Game client windows are **renamed to the note of their row**, so multiple clients are easy to tell apart.
+- **Remembers running game clients**: close and reopen the manager and it recognises the clients it started (by process id and start time).
+- **Private server mode**: a switch on the main window turns the manager into an account manager for private servers (no Arc), with its own account list. See *Private servers* below.
+- **Re-ordering accounts** by dragging the grip (three lines) at the left of every row up or down as far as you like, or with **Alt+Up** / **Alt+Down**.
+- **Deleting accounts** with a minus button on every row: click (asks first), Shift+click (no question), or Control+click several rows and press Alt+D. **Alt+A** selects ALL rows (then Alt+D deletes them, after asking).
+- **Built-in help**: press **F1** (a small "Help~F1" reminder is shown at the bottom of the main window) to read this README inside the program, nicely formatted, in a window with the same size and position as the main window. It is compiled into the program, so you can share **just the .exe** (or just the .ps1 script) and everything needed, README included, goes with it.
+- **Import / Export** of the accounts list as a text file.
+- A built-in **settings window** (gear icon) with *Basic*, *Advanced* (sub-tabs *Shared Settings*, *Hidden Arc Mode* and *Show Arc Mode*) and *Private Servers* pages, and a **log viewer** (paper icon) with *Copy log to clipboard*.
+- Optional background picture (a nice default is built into both versions: into the .exe, and into the script as a text block at its end).
+- Closing the manager while game clients are running (in **either** list: Official or Private Servers) asks first.
+- Portable: no installer, nothing is written outside `%AppData%\ArcManager` (and the program's own folder if you choose).
+
+---
+
+## Quick start
+
+### C++ version
+1. Put `ArcManager.exe` anywhere (the desktop is fine - it does not leave files next to itself).
+2. Double-click it and accept the administrator prompt (see *Security and privacy* for why).
+3. **Important for Hidden Arc Mode:** make sure **Perfect World International is the first game in Arc's library list** (see *PWI must be the first game in Arc's library* below).
+4. Type a username, password and (optionally) a note in the first row. Use **+ Add account** for more rows.
+5. Press **SIGN IN**.
+6. Optional: set the **Patcher Location** (gear icon > Basic) so the green **Update Client** button can open your game's launcher / patcher whenever the game needs an update.
+
+### PowerShell version
+1. Keep `ArcManager.ps1` and `StartArcManager.bat` together in one folder (the default background picture is built into the script).
+2. Double-click `StartArcManager.bat` (it starts the script with the right options) and accept the administrator prompt.
+3. Continue as above.
+
+The first time, the manager looks for `Arc.exe` by itself (a running Arc, the list of installed programs, and the usual
+`Program Files` folders on your drives). If it cannot find it, open the gear icon and set **Arc Location**.
+
+---
+
+## Updating the game client (manual)
+
+**This manager depends on the game client being up to date, and it can NOT check that for you.** It never connects to the internet and never detects that the game has a new version. After a game update the old client can fail to start, or the game's launcher / patcher can keep asking to update. **You have to keep the client up to date yourself, by hand.**
+
+The green **Update Client** button (top of the main window, half-way between the **PWI** title and the OFFICIAL / PRIVATE switch) makes that easy:
+
+1. Set the **Patcher Location** once: gear icon > **Basic** (directly under *Arc Location*) for the official game, or gear icon > **Private Servers** (directly under *Command-Line Flags*) for private servers. Pick the game's launcher / patcher program (for example `launcher.exe` or `patcher.exe` in the game's folder) with **Browse...**. The **Command-line flags** box on the same line is filled in with `arc:1` (the patcher needs it to start Arc); you can change it if that ever changes.
+2. Press **Update Client**. The button opens the patcher (with those flags) for the mode you are in (OFFICIAL or PRIVATE). You do not need to sign in first.
+3. **The patcher is shown normally - never hidden, and nothing is clicked for you.** Use it yourself and let it finish updating the game.
+
+Good to know:
+
+- If the Patcher Location is empty or wrong, the button tells you where to set it.
+- The button is greyed out while a sign-in is in progress, so the patcher you open yourself is never mixed up with the one a sign-in starts.
+- Whenever the **Starting Game** pop-up is on screen it reminds you: *(Check for updates [manually] if this fails)*.
+- A good habit: after a game update (or when a sign-in suddenly fails to reach the game), press **Update Client** first.
+
+---
+
+## Using the main window
+
+| Control | What it does |
+|---|---|
+| **Update Client** (green button, top, between the **PWI** title and the OFFICIAL / PRIVATE switch) | Opens the game's launcher / patcher (see *Updating the game client (manual)*) so you can update the game client yourself. Works without signing in. The location is set with **Patcher Location** in the settings, separately for OFFICIAL and PRIVATE. Greyed out while a sign-in is in progress. |
+| **OFFICIAL Servers / PRIVATE Servers** switch | At the top of the window. OFFICIAL Servers = the game through Arc (the default). PRIVATE Servers = private servers, see below. Each mode has its own account list, and the window title shows the mode ("PWI Account Manager - Official Servers" / "- Private Servers"). The manager opens in the mode it was closed in. |
+| **Drag handle** (three lines, far left of every row) | Press and hold the left mouse button on it and drag the row up or down: a blue line shows where the row will land, and the list scrolls by itself when you hold the mouse near its top or bottom edge. Let go to drop it (**Esc** while dragging cancels). The whole row (texts, running game client, status) moves with it and the new order is saved right away. **Keyboard:** press **Alt+Up** or **Alt+Down** while the cursor is in any box of a row to move that row one place. The handle is greyed out while a sign-in is in progress, and when there is only one row. |
+| **Minus button** (right of the drag handle) | Deletes that account. It is grey and turns red when you point at it. **Click** = delete, after a confirmation that shows the username and note. **Shift+click** = delete without asking. **Control+click** = select the row (it turns red with a ring) so you can select several; then press **Alt+D** to delete them all (it asks once; **Esc** clears the selection). Press **Alt+A** to select **all** rows at once (rows that are busy are skipped), then **Alt+D**. A counter next to the buttons shows how many rows are selected. A deleted account is gone from the list immediately and the list is saved right away (`accounts.txt.bak` keeps the version from before). The minus is greyed out for an account whose game client is running, and for all rows while a sign-in is in progress. There is always at least one row: deleting the last one just empties it. Rows left completely empty are also removed when you close the manager. |
+| Username / Password / Notes | One account per row. The note is also used as the game window title. |
+| **SIGN IN** | Signs in that account. While it works the button reads **CANCEL**. |
+| **STOP** | Force-closes that account's game client (asks first if you enabled *Ask before stopping*). |
+| Status text | Shows what is happening. Messages like *Stopped* or *Cancelled* return to *Idle* after a while. Running clients show their **PID**. |
+| **+ Add account** | Adds an empty row. |
+| **Import...** | Adds accounts from a text file in the same format as `accounts.txt` (`username`, `password`, `note`, separated by tabs). Accounts whose username is already in the list are skipped, never overwritten. |
+| **Export...** | Saves the accounts list to a text file (handy as a backup or for moving to another computer). **The file contains the passwords as plain text.** |
+| **Show passwords** | Shows or hides the passwords on screen. |
+| Paper icon | Opens the log viewer. |
+| Gear icon | Opens the settings window (it always opens on the *Basic* page). |
+| **F1** | Opens this README (built into the program) in a window with the same size and position as the main window. Works from the main window, the settings window and the log window. |
+| Closing the window | If game clients are running, in the shown list **or in the other one**, you are asked first. The clients keep running if you close the manager, and the next start recognises them again. |
+
+Usernames, passwords and notes cannot contain **tabs or line breaks** (they would corrupt the accounts file); such text is refused with a message.
+
+**Keyboard shortcuts**
+
+| Keys | What it does |
+|---|---|
+| **F1** | Opens the built-in help (this README, shown as formatted Markdown). Esc closes it. |
+| **Alt+A** | Selects ALL rows for deletion (rows whose game client is running are skipped; nothing works while a sign-in is in progress). |
+| **Alt+D** | Deletes the selected rows (asks once). **Esc** clears the selection. |
+| **Alt+Up** / **Alt+Down** | Moves the row that has the cursor up or down one place. |
+| **Esc** | Cancels a drag, clears the row selection, or closes the settings / log / help window. |
+
+---
+
+## Settings
+
+Open the **gear icon**. Changes take effect **immediately** after *SAVE CONFIGURATION* - no restart needed.
+*LOAD DEFAULTS* only fills in the standard values; nothing is saved until you press Save.
+*OPEN SETTINGS FOLDER* opens the folder with all of the program's files.
+
+Settings that were dropped in a newer version (`PrivateStartDir`, `PrivateNoticeShown`, `LauncherGraceSeconds`, `GraceSeconds`, `CloseArcAt`) are removed from the file automatically. Everything is stored in a plain text file, `ArcManager.ini`, which you can also edit by hand (save it and restart the
+manager). Comments in the file are kept when the program saves. Default values changed in a newer version only apply to a new settings file (or after *LOAD DEFAULTS* + Save); a settings file you already have keeps its saved values.
+
+| Key | Default | Window label | Meaning |
+|---|---|---|---|
+| `ArcPath` | `C:\Program Files (x86)\Arc\Arc.exe` | Arc Location | Full path to Arc. The file **must be named `Arc.exe`**. |
+| `PatcherPath` | `C:\Program Files (x86)\PWI_en\patcher\patcher.exe` | Patcher Location | **Basic page**, directly under *Arc Location* (entry field and **Browse...**; the flags box is on the same line). The game's launcher / patcher, opened by the **Update Client** button while OFFICIAL Servers is selected. Nothing else ever starts it. Greyed out while PRIVATE Servers is selected. |
+| `WindowWidth`, `WindowHeight` | `1280`, `720` | Main Window | Size of the window's inside area in pixels (minimum 1040 x 420). |
+| `RememberWindowSize` | `1` | Remember the Size When Closing | Saves the size when you close the manager. |
+| `UseHiddenLogin` | `1` | Launcher Mode | **Basic page.** `1` = **Hidden Arc Mode** (default), `0` = **Show Arc Mode**. See *Launcher Modes and automation*. |
+| `AutoFill` | `1` | Auto-Fill Username and Password | **Show Arc Mode only** (Hidden Arc Mode always types the login itself). Types the login into Arc's visible window. |
+| `ClickArcPlay` | `1` | Auto-Click Play (Arc) | **Show Arc Mode only.** After auto-fill has typed the login and pressed Enter, also clicks Arc's **Play** button for you. Needs *Auto-fill* and *Press Enter after the password*. Hidden Arc Mode always clicks Play. |
+| `ClickPatcherStart` | `1` | Auto-Click Start (Launcher/Patcher) | **Show Arc Mode only.** Once the launcher / patcher shows up, clicks its **Start** button (retrying until it succeeds) until the game client opens. **Hidden Arc Mode always clicks Start.** |
+| `PopupKey` | `enter` | Key for the Pop-Up | **Advanced page, "Login pop-up and typing".** The key (`enter` or `escape`) that clears any pop-ups before Arc's login page. |
+| `EntersBefore` | `0` | Enter/Escape Presses for the Pop-Up | How many times that key is pressed before the username is typed (`0` = none). |
+| `PauseAfterPopupMs` | `1500` | Pause After the Pop-Up (ms) | Pause after those presses (only used when the count is above 0). |
+| `ClearBackspaces` | `0` | Backspaces to Clear a Box | Backspaces pressed before typing the username and the password, to remove old text (`0` = none). |
+| `EnterAfterPassword` | `1` | Press Enter After the Password | Presses Enter after the password to log in. Turn it off if you want to press it yourself. |
+| `ConfirmStop` | `0` | Ask Before Stopping a Game Client | Confirmation before STOP. |
+| `KillArcOnStart` | `1` | Close Running Arc at Start / Sign-In | Closes a leftover Arc when the manager starts and before each sign-in. |
+| `RenameGameWindows` | `1` | Rename Game Windows to Notes | Sets each game window's title to its row's note. |
+| `ShowStorageHint` | `0` | Show Plain-Text Storage Notice | Shows a note at the bottom of the window that accounts are stored as plain text. |
+| `DebugLog` | `1` | Debug / Logs | Writes the log (never containing passwords). |
+| `BackgroundImage` | *(empty)* | Background Image Location | Your own picture. Empty = a `background.*` file next to the program, or the built-in image. |
+| `BackgroundMode` | `fill` | Mode | `fill`, `fit`, `stretch`, `tile` or `center`. |
+| `BackgroundDim` | `0.5` | Darkness | `0` = picture as it is, `1` = black. |
+| `UsernameFocusTabs` | `1` | Tabs Before Username Box | Tab presses sent first, to reach the username box. *(Advanced)* |
+| `FieldSeparatorTabs` | `1` | Tabs Between the Two Boxes | Tab presses between username and password. *(Advanced)* |
+| `LoginDelayMs` | `3000` | Login Delay (milliseconds) | Wait after Arc's login window appears, before typing. *(Advanced)* |
+| `MinWaitSeconds` | `6` | Minimum Wait (seconds) | Never type sooner than this after starting Arc. *(Advanced)* |
+| `WindowTimeoutSeconds` | `40` | Login Window Timeout | Give up waiting for the login window. *(Advanced)* |
+| `TimeoutSeconds` | `300` | Give Up After | Give up waiting for the game client. *(Advanced > Show Arc Mode)* |
+| `PendingTimeoutSeconds` | `600` | Game Wait After Close | How long to keep watching for the client after Arc was closed early. *(Advanced > Shared Settings)* |
+| `RenameDurationSeconds` | `180` | Rename Duration | The game opens and closes windows while loading, so its windows are re-checked every second for this long after the client starts. Raise it on a slow computer. *(Advanced > Shared Settings)* |
+| `StatusResetSeconds` | `30` | Reset Status After | Seconds until *Stopped / Cancelled / Timed out* return to *Idle* (`0` = never). *(Advanced > Shared Settings)* |
+| `PatcherStartPollIntervalMs` | `2000` | Click Start Every (ms) | How often **Start** is clicked while waiting for the launcher / patcher to finish and launch the game. *(Advanced > Shared Settings)* |
+| `PatcherStartTimeoutSeconds` | `180` | Give Up Clicking After (sec) | Stop clicking **Start** after this long. *(Advanced > Shared Settings)* |
+| *(the labels in the PowerShell version are worded a little differently)* | | | Applies to the five `Hidden...` rows below. |
+| `HiddenKeyDelayMs`, `HiddenCharDelayMs`, `HiddenPostTabDelayMs`, `HiddenPostFieldDelayMs`, `HiddenHideSettleDelayMs` | `20` each | Key Press Delay, Typed Character Delay, Pause After Tab / a Field / Hiding Sign In (ms) | Tiny pauses used while the login is typed into the off-screen Arc. *(Advanced > Hidden Arc Mode)* |
+| `HiddenSignInTimeoutSeconds`, `HiddenSignInPollIntervalMs` | `300`, `1000` | Sign In Window Timeout (sec), Poll Interval (ms) | How long to wait for Arc's Sign In window, and how often to check for it. *(Advanced > Hidden Arc Mode)* |
+| `HiddenMainWindowInitialDelayMs`, `HiddenMainWindowTimeoutSeconds`, `HiddenMainWindowPollIntervalMs` | `1600`, `60`, `1000` | Initial Delay Before Play (ms), Main Window Timeout (sec), Poll Interval (ms) | After the login is submitted: how long to wait before looking for Arc's real main window (too soon can find an unfinished placeholder), how long to keep looking, and how often. *(Advanced > Hidden Arc Mode)* |
+| `HiddenPatcherWaitTimeoutSeconds`, `HiddenPatcherWaitPollIntervalMs` | `120`, `1000` | Patcher Wait Timeout (sec), Poll Interval (ms) | After Play is clicked: how long to wait for the launcher / patcher to start, and how often to check. *(Advanced > Hidden Arc Mode)* |
+| `PrivateMode` | `0` | *(the switch on the main window)* | `1` = private server mode. |
+| `PrivateClientPath` | *(empty)* | Client or Launcher Location | **Private Servers page.** The program to start (the game client, or a launcher / patcher). |
+| `PrivateFlags` | `game:cpw nocheck startbypatcher console:1` | Command-Line Flags | Passed exactly as typed. The usual flags are filled in; change them for a server that needs different ones (copy the example above to get them back). |
+| `PatcherFlags` | `arc:1` | Command-Line Flags (next to Patcher Location) | **Basic page.** Passed to the patcher exactly as typed. Started by itself, the patcher would not start Arc; `arc:1` makes it do so. Change it here if that ever changes (empty = no flags). |
+| `PrivatePatcherFlags` | *(empty)* | Command-Line Flags (next to Patcher Location) | **Private Servers page.** The same for the private server's patcher. Empty by default (private servers do not use Arc); fill it in only if that server's patcher needs flags. |
+| `PrivatePatcherPath` | *(empty)* | Patcher Location | **Private Servers page**, directly under *Command-Line Flags* (entry field and **Browse...**). The private server's launcher / patcher, opened by the **Update Client** button while PRIVATE Servers is selected. |
+| `PrivateShowWarning` | `1` | Show a Warning When Switching to Private Servers | The warning is shown every time you switch to Private Servers (never at start-up). `0` = never show it. |
+| `PrivateProcessNames` | `elementclient.exe,elementclient_64.exe` | Process Name(s) to Wait for | The real game client, separated by commas. |
+| `PrivateWindowWaitSeconds` | `90` | Wait for the Game Window | Give up waiting for the client and its window after this long. |
+| `PrivateFirstKeyDelaySeconds` | `6` | Wait Before the First Key | Pause after the window appears. |
+| `PrivatePopupKey` | `enter` | Key for the Pop-Up | The key that clears the pop-up message some clients show before the login page: `enter` or `escape` (radio buttons on the Private Servers page). |
+| `PrivateEntersBefore` | `1` | Enter/Escape Presses for the Pop-Up | How many times that key is pressed (`0` = none). |
+| `PrivatePauseAfterPopupMs` | `1500` | Pause After the Pop-Up | Milliseconds. |
+| `PrivatePauseStepMs` | `400` | Pause Between Steps | Milliseconds. |
+| `PrivateTabs` | `1` | Tabs Between the Two Boxes | Tab presses between username and password. |
+| `PrivateClearBackspaces` | `0` | Backspaces to Clear a Box | Removes old text (for example a remembered username) before typing. `0` = none. |
+| `PrivateEnterAfterPassword` | `1` | Press Enter After the Password | Logs in. |
+| `RunElevated` | `1` | *(not in the window)* | **PowerShell version only**: restart as administrator. The C++ version always asks for it. |
+
+### Where the files are
+
+Everything lives in `%AppData%\ArcManager` (type that into the Explorer address bar):
+
+| File | Purpose |
+|---|---|
+| `ArcManager.ini` | The settings. |
+| `accounts.txt` | Your accounts (**plain text**, see below). `accounts.txt.bak` is the previous version, kept automatically. |
+| `accounts-private.txt` | The accounts for private server mode (same format, own `.bak`). |
+| `session.txt`, `session-private.txt` | Which game clients are running in each mode (so they are recognised after a restart). |
+| `debug.log` / `debug.previous.log` | The log of this run and of the run before it. |
+
+**Portable mode:** if a file called `ArcManager.ini` sits next to the program, that copy is used instead.
+The program never creates it by itself.
+
+---
+
+## Launcher Modes and automation
+
+**Launcher Mode** (Basic page) decides how the manager gets through Arc's login. Either way Arc runs and signs in for real - the manager never bypasses Arc's own login.
+
+| Mode | What happens |
+|---|---|
+| **Hidden Arc Mode** (default) | Arc's window is hidden throughout the login process (it may flicker very briefly on your screen). The manager types the login, clicks **Play**, and closes Arc the instant the launcher / patcher is detected. **The game's launcher / patcher window is hidden too** (kept off-screen while **Start** is clicked for you, until the game client starts); there is no separate setting for this. A pop-up reading **Obtaining ARC / PWI TOKEN Now** is shown meanwhile, and disappears the moment the launcher / patcher is detected. |
+| **Show Arc Mode** | Arc's window is shown, and so is the launcher / patcher (it is never hidden in this mode). With *Auto-fill* on, the login is typed into it (the old pop-up method; its timing is on *Advanced > Show Arc Mode*). With *Auto-click Play (arc)* also on, **Play** is clicked for you too; otherwise you click it yourself. |
+
+**Starting the game.** In Hidden Arc Mode (always) or in Show Arc Mode with *Auto-click Start (launcher/patcher)* on, the manager keeps clicking **Start** on the launcher / patcher until it succeeds, then waits for the game client. A second pop-up, **Starting Game**, is shown meanwhile and closes the instant the game client (`elementclient.exe` or `elementclient_64.exe`) is detected (or on CANCEL / timeout); at its bottom it shows *(Check for updates [manually] if this fails)* - if the start fails, the game client may simply be out of date (see *Updating the game client (manual)*). With the option off, press **Start** yourself; the manager still recognises the game client. The moment the game client starts, the launcher / patcher that sign-in started is **force-closed** (it can otherwise linger for a long time); this has no setting. It is skipped while another account is still signing in or waiting for its client, so that account's launcher is never closed by mistake.
+
+**Advanced page sub-tabs**
+
+- **Shared Settings** (opens first): settings used by both modes - *Game wait after close*, *Rename duration*, *Reset status after*, *Click Start every*, *Give up clicking after*.
+- **Hidden Arc Mode**: the timing of the hidden sign-in. Greyed out while Show Arc Mode is selected.
+- **Show Arc Mode**: the timing of the visible auto-fill method, and *Give up after*. Greyed out while Hidden Arc Mode is selected.
+
+### PWI must be the first game in Arc's library
+
+The automatic **Play** click (always in Hidden Arc Mode, and in Show Arc Mode when *Auto-click Play (arc)* is on) is sent to a fixed spot on Arc's main window: the **first game in Arc's library list**. If **Perfect World International is not the first game there, a different Arc game may be started instead.** This matters if you also play other games through Arc.
+
+Recommended: in Arc's library, **sort by "last played"** (if your version of Arc offers it) and make sure **PWI was the last game you played before using the manager**. After that the manager keeps it that way by itself, because every game it starts is PWI - until you start another game from Arc, which moves that game to the top. If in doubt, open Arc, check that PWI is first, and close it again. Show Arc Mode without *Auto-click Play (arc)* does not have this limit, since you click Play yourself.
+
+Clicks are sent to the windows as messages, so they work even when a window is hidden or in the background. They use fixed positions measured on Arc's main window and on the game patcher (`984 x 744`); if a future Arc or patcher update moves its buttons, the automatic clicks may miss and you can simply click the button yourself (turn the matching *Auto-click* option off if it gets in the way).
+
+---
+
+## Private Servers
+
+Many private servers do not use Arc: the game client logs in directly. Switch the manager to **PRIVATE Servers** (the switch at the
+top of the main window) and it works as an account manager for them. The manager opens in whichever mode it was closed in. The official mode is not affected in any way.
+
+**Set it up** (gear icon > **Private Servers**):
+
+1. **Client or launcher location**: the program to start. Usually the server's game client (`elementclient.exe`), but it can
+   also be a launcher or patcher. It is started with administrator rights, in its own folder.
+2. **Command-Line Flags**: passed exactly as typed. The usual ones (`game:cpw nocheck startbypatcher console:1`) are filled in; change them if your server needs different flags. Never put your password here.
+3. **Patcher Location** (optional, with its own **Command-Line Flags** box on the same line, empty by default): the private server's launcher / patcher. The green **Update Client** button opens it while PRIVATE Servers is selected, so you can update that server's client by hand. It is never started by SIGN IN.
+4. **Process name(s)**: the real game client. If you start a launcher, the manager waits until one of these processes appears.
+5. The **typing sequence**: Enter *or Escape* for the start-up pop-up (you choose the key, and how many presses; `0` if your client has none), a pause, the username, a
+   pause, Tab, a pause, the password, a pause, Enter. All counts and pauses can be changed (and *Backspaces to clear a box* removes old text such as a remembered username first, `0` = off), because every server and every
+   computer is different.
+
+**What SIGN IN does in private mode:** starts the program, waits for the game client and its window, waits a few seconds,
+then types the login as described above. The button reads **CANCEL** meanwhile (it closes the program it started).
+**STOP**, the PID display, remembering running clients, window renaming and the log work as in official mode. Arc is
+never touched in private mode, so an official game that is already running is safe.
+
+**Good to know**
+
+- Each mode has its **own account list** (`accounts-private.txt`). This keeps your official Arc password from ever being typed
+  into a private server by mistake. **Use different passwords for private servers**: they are run by other people.
+- A warning explains this every time you switch to Private Servers. Turn it off with *Show a warning when switching to Private Servers* on the Private Servers page.
+- If the keys do not reach the game, or the login is typed too early, raise the pauses and the wait before the first key.
+  The log (paper icon) records every step.
+- Servers that use a launcher with its own login form, or a web login, cannot be filled in this way.
+
+## The log viewer
+
+Click the **paper icon**. *This run / Previous run*, *Update live*, **COPY LOG TO CLIPBOARD** and *OPEN LOG FOLDER*.
+The copied report starts with the program version, your Windows version, whether Arc was found and the non-secret
+settings. It contains **no paths, usernames or passwords**, so it is safe to paste into a bug report.
+
+---
+
+## Security and privacy - please read
+
+- **Accounts are stored as PLAIN TEXT** in `%AppData%\ArcManager\accounts.txt` (and `accounts-private.txt`). Anyone who can read your Windows user
+  profile can read your passwords. Do not use passwords you use elsewhere, and do not share the file or the folder.
+  (Turn on *Show Plain-Text Storage Notice* in the settings to be reminded at the bottom of the window.) The version number is shown at the bottom right of the main window.
+- **No network access.** The program never connects to the internet. It does not send or upload anything, and it never checks whether the game client (or this program) is up to date. The **Update Client** button only opens the game's own patcher, which does its own downloading.
+- **Private servers** are run by third parties. Keep their passwords separate from your official ones (the two modes use separate account lists).
+- **Why administrator rights?** To type into Arc's windows and close its processes, the manager has to run with the
+  same rights as Arc. For safety it only ever launches a program named **`Arc.exe`**, and only closes Arc, launcher,
+  patcher and the game client of the accounts it manages.
+- **The log never contains passwords** (or usernames); only things like the number of characters typed.
+- **Antivirus warnings:** a program that types into other windows and closes processes can look suspicious to some
+  antivirus tools, especially when it is not digitally signed. The complete source code is included - you can read it
+  and build it yourself.
+
+---
+
+## Troubleshooting
+
+1. Click the **paper icon**, then **COPY LOG TO CLIPBOARD**, and look at (or share) the text.
+2. *Arc not found*: set **Arc Location** with the gear icon (Browse...).
+3. *Typing goes to the wrong box or too early* (Show Arc Mode): **Advanced > Show Arc Mode** - raise **Login delay**, or change the **Tabs** values. If Arc shows a message before its login page, use *Login pop-up and typing* on the same page.
+4. *Game windows are not renamed*: check *Rename game windows to Notes*, that the row has a note, and raise
+   **Rename duration** on a slow computer.
+5. *The game will not start, or asks to be updated, after a game update*: the game client is out of date and updates are never detected automatically. Press the green **Update Client** button (set **Patcher Location** first if it asks) and let the patcher finish, then sign in again.
+6. *Update Client says the Patcher Location is not set*: gear icon > Basic > **Patcher Location** (OFFICIAL) or gear icon > Private Servers > **Patcher Location** (PRIVATE), then **Browse...**.
+7. *A different Arc game starts*: PWI is not the first game in Arc's library list - see *PWI must be the first game in Arc's library*.
+8. *Hidden Arc Mode does not get past a step* (or a pop-up stays): see the log; raise the matching timeout on **Advanced > Hidden Arc Mode**, or switch to **Show Arc Mode** on the Basic page. *A launcher / patcher is invisible and seems stuck* (Hidden Arc Mode hides it): press **CANCEL** on the row (that closes it), or switch to **Show Arc Mode** to see what it is asking. *Start is not clicked*: check *Auto-click Start*, and raise **Give up clicking after** on **Advanced > Shared Settings**.
+9. *Accounts file damaged*: the previous version is `accounts.txt.bak` in the same folder.
+10. *Start over*: close the manager and delete `ArcManager.ini` (settings) - it is recreated with the defaults.
+
+---
+
+## Building from source
+
+The C++ program is `main.cpp` plus a resource script and the small built-in Markdown viewer in `mdview\` (used for the F1 help).
+
+**Tools:** [w64devkit](https://github.com/skeeto/w64devkit) **x86 (32-bit)** kit, so the result runs on every Windows
+from XP to 11. Check with `gcc -dumpmachine` (it should say `i686-w64-mingw32`).
+
+1. Put `w64devkit\bin` on your PATH (or open its terminal) and go to the project folder.
+2. Run **`build.bat`** (or `make`). The first build also compiles the Markdown parser (about 40 small C files), so it takes a little longer; later builds are quick.
+3. `ArcManager.exe` is created (in `bin\` when you use `build.bat`). Optionally open the folder as a project in the Eclipse C/C++ IDE.
+
+Files: `main.cpp` (program), `ArcManager.rc` (icon, built-in background, **this README** as the F1 help, version information), `resource.h`
+(ids **and version text**), `ArcManager.manifest` (administrator + visual styles), `res\` (icon and default background), `mdview\` (the Markdown viewer: `mdview.cpp`, `layout.cpp`, and the `cmark-gfm\` parser sources with its license).
+
+### The built-in help (F1)
+This `README.md` is compiled into `ArcManager.exe` as a resource, so **edit `README.md`, then rebuild** (the Makefile notices the change) and F1 shows the new text, nicely formatted (headings, lists, tables, code, links; you can select and copy text, and **Ctrl+A** / **Ctrl+C** work). Keep it plain ASCII (no curly quotes) and without the two characters `#` followed by `>` together, because the PowerShell version keeps a copy of the README in a comment block at the very end of `ArcManager.ps1` (between two README marker lines, right below the background picture block); after changing the README, replace the text between those two marker lines with the new README text.
+
+### Changing the version information
+Edit the clearly marked block at the top of **`resource.h`** (file description, product name, version text, numeric
+version, copyright) and rebuild. The text is shown in *Properties > Details* of `ArcManager.exe`, in the log and at the
+bottom right of the main window (the settings window shows the copyright). For the PowerShell version change `$AppVersion` near the top of `ArcManager.ps1`.
+
+---
+
+## Project layout
+
+```
+ArcManager.exe  (built)        C++ version
+  main.cpp  ArcManager.rc  resource.h  ArcManager.manifest  build.bat  Makefile  res\  README.md (compiled into the .exe)
+  mdview\  (built-in Markdown viewer for F1: mdview.cpp/.h, layout.cpp/.h, cmark-gfm\)
+  (The PowerShell version has no such folder: it turns the same README into formatted rich text itself.)
+ArcManager.ps1  StartArcManager.bat                           PowerShell version (the default background and this README are inside the script)
+README.md
+```
+
+## Credits and license
+
+Made by **Sparc343**.
+
+**License:** *to be decided.*
+
+The F1 help viewer uses the layout engine of **GhostReader** (by Sparc343) and the **cmark-gfm** Markdown parser
+(Copyright (c) 2014, John MacFarlane and contributors; BSD 2-Clause license, see `mdview\cmark-gfm\COPYING`).
+BUILTIN-README-END
 #>

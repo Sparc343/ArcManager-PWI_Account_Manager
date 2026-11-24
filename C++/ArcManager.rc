@@ -4,6 +4,7 @@
 1 24 "ArcManager.manifest"
 IDI_APPICON ICON "res/ArcManager.ico"
 IDR_DEFAULT_BG RCDATA "res/default_background.png"
+IDR_README RCDATA "README.md"
 
 // ---------------------------------------------------------------------------------------------
 // Version information (Explorer -> Properties -> Details). The VALUES come from resource.h:

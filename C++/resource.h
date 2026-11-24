@@ -4,6 +4,7 @@
 
 #define IDI_APPICON       1     // program icon (taskbar, title bar, Explorer)
 #define IDR_DEFAULT_BG    101   // built-in default background image (PNG)
+#define IDR_README        102   // built-in help (README.md, shown with F1)
 
 // =====================================================================================================
 //  VERSION INFORMATION  (shown in Windows Explorer: right-click ArcManager.exe -> Properties -> Details)
@@ -12,8 +13,8 @@
 // =====================================================================================================
 #define APP_FILE_DESCRIPTION  "PWI Account Manager"   // "File description"
 #define APP_PRODUCT_NAME      "ArcManager"            // "Product name"
-#define APP_VERSION_TEXT      "v6.NOV.2026"          // "File version" AND "Product version" (any text)
-#define APP_VERSION_NUMERIC   2026,11,6,0             // the same version as four numbers: year,month,day,0
+#define APP_VERSION_TEXT      "v23.NOV.2026"         // "File version" AND "Product version" (any text)
+#define APP_VERSION_NUMERIC   2026,11,23,0            // the same version as four numbers: year,month,day,0
 #define APP_COPYRIGHT         "\251 2026 Sparc343"    // "Copyright" (\251 is the (c) sign; keep it as it is)
 // Language: English (United States) - set in ArcManager.rc ("040904B0" / 0x0409,0x04B0)
 
